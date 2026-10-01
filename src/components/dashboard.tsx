@@ -31,6 +31,9 @@ export function Dashboard({ name = "Admin" }: { name?: string }) {
   const [expiringOpen, setExpiringOpen] = useState(false);
   const initials = name.split(" ").map((s) => s[0]).join("").slice(0, 2).toUpperCase();
   const [mobileOpen, setMobileOpen] = useState(false);
+  useEffect(() => {
+    if (window.location.hash === "#settings" || new URLSearchParams(window.location.search).has("gmailOAuth")) setActive("Settings");
+  }, []);
   const currency = useGymCurrency();
   useAdminRealtime();
   const [clock, setClock] = useState(() => new Date());

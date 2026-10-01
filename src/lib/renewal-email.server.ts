@@ -1,9 +1,3 @@
-function requiredEnv(name: string) {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing required environment variable: ${name}`);
-  return value;
-}
-
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -20,14 +14,14 @@ function encodeMimeBody(value: string) {
   return base64.match(/.{1,76}/g)?.join("\r\n") || "";
 }
 
-export async function getGmailAccessToken() {
+export async function getGmailAccessToken(credentials: { clientId: string; clientSecret: string; refreshToken: string }) {
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      client_id: requiredEnv("GMAIL_CLIENT_ID"),
-      client_secret: requiredEnv("GMAIL_CLIENT_SECRET"),
-      refresh_token: requiredEnv("GMAIL_REFRESH_TOKEN"),
+      client_id: credentials.clientId,
+      client_secret: credentials.clientSecret,
+      refresh_token: credentials.refreshToken,
       grant_type: "refresh_token",
     }),
     signal: AbortSignal.timeout(12_000),
@@ -41,6 +35,7 @@ export async function getGmailAccessToken() {
 
 export async function sendRenewalEmail({
   accessToken,
+  senderEmail,
   gymName,
   memberName,
   email,
@@ -51,6 +46,7 @@ export async function sendRenewalEmail({
   reminderId,
 }: {
   accessToken: string;
+  senderEmail: string;
   gymName: string;
   memberName: string;
   email: string;
@@ -60,9 +56,8 @@ export async function sendRenewalEmail({
   reminderDaysBefore: number;
   reminderId: string;
 }) {
-  const senderEmail = requiredEnv("GMAIL_SENDER_EMAIL");
   if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(senderEmail)) {
-    throw new Error("GMAIL_SENDER_EMAIL must be a valid Gmail address.");
+    throw new Error("The connected Gmail sender address is invalid. Reconnect Gmail in Admin Settings.");
   }
   if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email)) {
     throw new Error("Member email address is invalid.");

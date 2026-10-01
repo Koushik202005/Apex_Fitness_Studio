@@ -469,6 +469,39 @@ export type Database = {
           },
         ]
       }
+      gym_gmail_oauth: {
+        Row: {
+          client_id: string
+          client_secret_ciphertext: string
+          connected_at: string | null
+          id: number
+          refresh_token_ciphertext: string | null
+          sender_email: string | null
+          updated_at: string
+          updated_by: string | null
+        }
+        Insert: {
+          client_id: string
+          client_secret_ciphertext: string
+          connected_at?: string | null
+          id?: number
+          refresh_token_ciphertext?: string | null
+          sender_email?: string | null
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Update: {
+          client_id?: string
+          client_secret_ciphertext?: string
+          connected_at?: string | null
+          id?: number
+          refresh_token_ciphertext?: string | null
+          sender_email?: string | null
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Relationships: []
+      }
       gym_settings: {
         Row: {
           address: string | null

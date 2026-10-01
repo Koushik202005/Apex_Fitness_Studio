@@ -281,6 +281,93 @@ async function requireAdmin(context: { supabase: import("@supabase/supabase-js")
   if (error || !roleRow) throw new Error("Only administrators can perform this action.");
 }
 
+/* ---------------- Admin: Gmail OAuth for renewal email ---------------- */
+
+const gmailOAuthSetupSchema = z.object({
+  clientId: z.string().trim().min(10).max(300),
+  clientSecret: z.string().trim().max(500).optional().default(""),
+});
+
+export const getGmailOAuthSettings = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const [{ supabaseAdmin }, { getRequest }, oauth] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@tanstack/react-start/server"),
+      import("@/lib/gmail-oauth.server"),
+    ]);
+    const row = await oauth.readGmailOAuthRow(supabaseAdmin);
+    const request = getRequest();
+    return {
+      clientId: row?.client_id ?? "",
+      senderEmail: row?.sender_email ?? null,
+      connectedAt: row?.connected_at ?? null,
+      callbackUrl: request ? oauth.gmailCallbackUrl(request.url) : "",
+      configured: Boolean(row?.refresh_token_ciphertext && row.sender_email),
+    };
+  });
+
+export const beginGmailOAuth = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof gmailOAuthSetupSchema>) => gmailOAuthSetupSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const request = (await import("@tanstack/react-start/server")).getRequest();
+    if (!request) throw new Error("Could not read the current request. Reload Settings and try again.");
+    const [{ supabaseAdmin }, oauth] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@/lib/gmail-oauth.server"),
+    ]);
+    const previous = await oauth.readGmailOAuthRow(supabaseAdmin);
+    const clientId = data.clientId.trim();
+    if (!clientId.endsWith(".apps.googleusercontent.com")) throw new Error("Enter the Google OAuth Web client ID ending in .apps.googleusercontent.com.");
+    const submittedSecret = data.clientSecret.trim();
+    if (previous && previous.client_id !== clientId && !submittedSecret) {
+      throw new Error("Enter the client secret that belongs to the new client ID.");
+    }
+    const priorSecret = !submittedSecret && previous?.client_secret_ciphertext ? oauth.decryptGmailSecret(previous.client_secret_ciphertext) : "";
+    const clientSecret = submittedSecret || priorSecret;
+    if (!clientSecret) throw new Error("Enter your Google OAuth client secret.");
+    const credentialsChanged = Boolean(previous && (previous.client_id !== clientId || submittedSecret));
+    const { error } = await supabaseAdmin.from("gym_gmail_oauth").upsert({
+      id: 1,
+      client_id: clientId,
+      client_secret_ciphertext: oauth.encryptGmailSecret(clientSecret),
+      refresh_token_ciphertext: credentialsChanged ? null : previous?.refresh_token_ciphertext ?? null,
+      sender_email: credentialsChanged ? null : previous?.sender_email ?? null,
+      connected_at: credentialsChanged ? null : previous?.connected_at ?? null,
+      updated_by: context.userId,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "id" });
+    if (error) throw new Error(`Could not save Gmail OAuth settings: ${error.message}`);
+
+    const redirectUri = oauth.gmailCallbackUrl(request.url);
+    const state = oauth.sealOAuthState({ adminId: context.userId, issuedAt: Math.floor(Date.now() / 1000), nonce: oauth.createOAuthNonce(), redirectUri });
+    const authorizationUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    authorizationUrl.search = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: `openid email ${oauth.GMAIL_SEND_SCOPE}`,
+      access_type: "offline",
+      include_granted_scopes: "true",
+      prompt: "consent",
+      state,
+    }).toString();
+    return { authorizationUrl: authorizationUrl.toString() };
+  });
+
+export const disconnectGmailOAuth = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await supabaseAdmin.from("gym_gmail_oauth").delete().eq("id", 1);
+    if (error) throw new Error(`Could not disconnect Gmail: ${error.message}`);
+    return { disconnected: true };
+  });
+
 const expiringMembershipSchema = z.object({ membershipId: z.string().uuid() });
 
 export const getExpiringMembers = createServerFn({ method: "GET" })
@@ -432,10 +519,15 @@ export const sendExpiringMemberReminder = createServerFn({ method: "POST" })
     }
 
     try {
-      const { getGmailAccessToken, sendRenewalEmail } = await import("@/lib/renewal-email.server");
-      const accessToken = await getGmailAccessToken();
+      const [{ getGmailAccessToken, sendRenewalEmail }, { loadGmailOAuthCredentials }] = await Promise.all([
+        import("@/lib/renewal-email.server"),
+        import("@/lib/gmail-oauth.server"),
+      ]);
+      const gmailCredentials = await loadGmailOAuthCredentials(db);
+      const accessToken = await getGmailAccessToken(gmailCredentials);
       const providerMessageId = await sendRenewalEmail({
         accessToken,
+        senderEmail: gmailCredentials.senderEmail,
         gymName: gym.gym_name || "GYM MANAGER",
         memberName: profile.display_name || "",
         email: profile.email,

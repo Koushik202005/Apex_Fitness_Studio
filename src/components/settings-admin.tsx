@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent, type ChangeEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { ImagePlus, Loader2, Save, Trash2 } from "lucide-react";
+import { CheckCircle2, ExternalLink, ImagePlus, Loader2, Mail, Save, Trash2, Unplug } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getGymSettings, saveGymSettings } from "@/lib/gym.functions";
 import { CURRENCIES, GYM_COUNTRIES, type CountryCode, type CurrencyCode } from "@/lib/currency";
+import { beginGmailOAuth, disconnectGmailOAuth, getGmailOAuthSettings } from "@/lib/gym.functions";
 
 const MAX_LOGO_SIZE = 2 * 1024 * 1024;
 const ACCEPTED_LOGO_TYPES = ["image/png", "image/jpeg", "image/webp"];
@@ -210,5 +211,92 @@ export function SettingsAdmin() {
         <Button disabled={busy}>{busy ? <Loader2 className="animate-spin" size={16}/> : <Save size={16}/>}Save settings</Button>
       </div>
     </form>
+    <GmailOAuthSettings />
   </section>;
+}
+
+function GmailOAuthSettings() {
+  const queryClient = useQueryClient();
+  const loadOAuthSettings = useServerFn(getGmailOAuthSettings);
+  const beginOAuth = useServerFn(beginGmailOAuth);
+  const disconnect = useServerFn(disconnectGmailOAuth);
+  const oauthSettings = useQuery({ queryKey: ["gmail-oauth-settings"], queryFn: () => loadOAuthSettings() });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    const outcome = new URLSearchParams(window.location.search).get("gmailOAuth");
+    if (!outcome) return;
+    const notices: Record<string, string> = {
+      connected: "Gmail connected. Renewal reminders can now be sent from this account.",
+      denied: "Google authorization was cancelled. Any previous Gmail connection is unchanged.",
+      invalid: "The authorization request was invalid or expired. Start again from Settings.",
+      admin_required: "The administrator account could not be confirmed. Sign in again and retry.",
+      setup_missing: "OAuth settings were removed before authorization completed. Start again from Settings.",
+      exchange_failed: "Google could not exchange the authorization code. Check the OAuth client and callback URL, then retry.",
+      scope_missing: "Gmail send permission was not granted. Reconnect and allow the requested permission.",
+      email_missing: "Google did not return a verified sender email. Reconnect with a Gmail account.",
+      refresh_missing: "Google did not issue an offline refresh token. Reconnect and approve access again.",
+      failed: "Gmail could not be connected. Verify Google Cloud OAuth setup and retry.",
+    };
+    if (outcome === "connected") void queryClient.invalidateQueries({ queryKey: ["gmail-oauth-settings"] });
+    setNotice(notices[outcome] || "Gmail OAuth setup finished.");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("gmailOAuth");
+    window.history.replaceState({}, "", url.toString());
+  }, [queryClient]);
+
+  async function connect(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const result = await beginOAuth({ data: { clientId: String(form.get("gmailClientId") || ""), clientSecret: String(form.get("gmailClientSecret") || "") } });
+      window.location.assign(result.authorizationUrl);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start Gmail authorization.");
+      setBusy(false);
+    }
+  }
+
+  async function disconnectAccount() {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await disconnect();
+      await queryClient.invalidateQueries({ queryKey: ["gmail-oauth-settings"] });
+      setNotice("Gmail disconnected. Renewal reminders will remain unsent until an account is connected again.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not disconnect Gmail.");
+    } finally { setBusy(false); }
+  }
+
+  if (oauthSettings.isLoading) return <div className="mt-8 flex items-center gap-3 border-t border-border pt-6 text-sm text-muted-foreground"><Loader2 className="animate-spin" size={17}/>Loading reminder email settings…</div>;
+  if (oauthSettings.isError || !oauthSettings.data) return <div className="mt-8 border-t border-border pt-6"><h3 className="font-semibold">Reminder email sender</h3><p className="mt-2 text-sm text-destructive">{oauthSettings.error instanceof Error ? oauthSettings.error.message : "Could not load Gmail OAuth settings."}</p></div>;
+
+  const current = oauthSettings.data;
+  return <div className="mt-8 border-t border-border pt-6">
+    <div className="mb-5 flex items-start gap-3">
+      <span className="grid size-10 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><Mail size={19}/></span>
+      <div><h3 className="font-display text-lg font-bold">Membership reminder email</h3><p className="mt-1 text-sm text-muted-foreground">Connect the Gmail account that should send scheduled and manual membership renewal reminders.</p></div>
+    </div>
+    {current.configured ? <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-success/30 bg-success-soft px-4 py-3">
+      <div className="flex items-center gap-2 text-sm"><CheckCircle2 className="text-success" size={17}/><span><strong>{current.senderEmail}</strong> is connected</span></div>
+      <Button type="button" variant="outline" disabled={busy} onClick={disconnectAccount}><Unplug size={15}/>Disconnect</Button>
+    </div> : <p className="mb-4 rounded-md border border-warning/30 bg-warning-soft px-4 py-3 text-sm text-warning">No Gmail account is connected. Automatic and manual renewal reminder emails are currently unavailable.</p>}
+    <form key={`${current.clientId}:${current.configured}`} onSubmit={connect} className="space-y-4">
+      <label className="block max-w-2xl"><span className="form-label">Google OAuth Web client ID</span><input name="gmailClientId" type="text" required maxLength={300} defaultValue={current.clientId} placeholder="...apps.googleusercontent.com" className="form-input" autoComplete="off"/><span className="mt-1 block text-xs text-muted-foreground">Create a Web application OAuth client in Google Cloud and enable the Gmail API.</span></label>
+      <label className="block max-w-2xl"><span className="form-label">Google OAuth client secret</span><input name="gmailClientSecret" type="password" maxLength={500} required={!current.clientId} placeholder={current.clientId ? "Leave blank to keep the saved secret" : "Paste the client secret"} className="form-input" autoComplete="new-password"/><span className="mt-1 block text-xs text-muted-foreground">Enter the secret if changing the client ID. The secret and refresh token are encrypted and stored server-side, and are never returned to this page.</span></label>
+      <div className="max-w-2xl rounded-md border border-border bg-muted/30 p-4">
+        <p className="text-sm font-semibold">Authorized redirect URI</p>
+        <code className="mt-2 block break-all text-xs text-foreground">{current.callbackUrl || "Loading callback URL…"}</code>
+        <p className="mt-2 text-xs text-muted-foreground">Add this exact URL in Google Cloud Console under your OAuth client’s authorized redirect URIs. Google requires the redirect URI to match exactly.</p>
+      </div>
+      {(error || notice) && <p role={error ? "alert" : "status"} className={`text-sm ${error ? "text-destructive" : "text-success"}`}>{error || notice}</p>}
+      <div className="flex flex-wrap items-center gap-3">
+        <Button disabled={busy}>{busy ? <Loader2 className="animate-spin" size={16}/> : <ExternalLink size={16}/>} {current.configured ? "Reconnect Gmail" : "Save credentials and connect Gmail"}</Button>
+        <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer" className="text-sm font-semibold text-primary hover:underline">Open Google Cloud credentials <ExternalLink className="inline" size={13}/></a>
+      </div>
+    </form>
+  </div>;
 }
