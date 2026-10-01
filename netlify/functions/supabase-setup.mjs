@@ -3,11 +3,10 @@ import { timingSafeEqual } from "node:crypto";
 const NETLIFY_API = "https://api.netlify.com/api/v1";
 
 function json(statusCode, payload) {
-  return {
-    statusCode,
+  return new Response(JSON.stringify(payload), {
+    status: statusCode,
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-    body: JSON.stringify(payload),
-  };
+  });
 }
 
 function matchesSecret(provided, expected) {
@@ -36,14 +35,14 @@ async function netlifyRequest(path, init = {}) {
   return data;
 }
 
-export default async function handler(event) {
-  if (event.httpMethod !== "POST") return json(405, { error: "Use POST to save the database connection." });
+export default async function handler(request) {
+  if (request.method !== "POST") return json(405, { error: "Use POST to save the database connection." });
   if (!process.env.SUPABASE_SETUP_TOKEN || process.env.SUPABASE_SETUP_TOKEN.length < 32 || !process.env.NETLIFY_AUTH_TOKEN || !process.env.NETLIFY_SITE_ID) {
     return json(503, { error: "Database setup is not enabled yet. The deployment owner must configure its Netlify setup variables first." });
   }
 
   let input;
-  try { input = JSON.parse(event.body || "{}"); } catch { return json(400, { error: "The submitted setup details are invalid." }); }
+  try { input = await request.json(); } catch { return json(400, { error: "The submitted setup details are invalid." }); }
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return json(400, { error: "The submitted setup details are invalid." });
   }
