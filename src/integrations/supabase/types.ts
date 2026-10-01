@@ -469,6 +469,36 @@ export type Database = {
           },
         ]
       }
+      gym_payment_gateway_credentials: {
+        Row: {
+          id: number
+          razorpay_key_id_ciphertext: string | null
+          razorpay_key_secret_ciphertext: string | null
+          stripe_secret_key_ciphertext: string | null
+          stripe_webhook_secret_ciphertext: string | null
+          updated_at: string
+          updated_by: string | null
+        }
+        Insert: {
+          id?: number
+          razorpay_key_id_ciphertext?: string | null
+          razorpay_key_secret_ciphertext?: string | null
+          stripe_secret_key_ciphertext?: string | null
+          stripe_webhook_secret_ciphertext?: string | null
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Update: {
+          id?: number
+          razorpay_key_id_ciphertext?: string | null
+          razorpay_key_secret_ciphertext?: string | null
+          stripe_secret_key_ciphertext?: string | null
+          stripe_webhook_secret_ciphertext?: string | null
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Relationships: []
+      }
       gym_gmail_oauth: {
         Row: {
           client_id: string

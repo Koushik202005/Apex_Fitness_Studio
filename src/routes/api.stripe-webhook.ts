@@ -5,7 +5,12 @@ export const Route = createFileRoute("/api/stripe-webhook")({
   server: {
     handlers: {
       POST: async ({ request }) => {
-        const secret = process.env["STRIPE_WEBHOOK_SECRET"];
+        const [{ supabaseAdmin }, { loadPaymentGatewayCredentials }] = await Promise.all([
+          import("@/integrations/supabase/client.server"),
+          import("@/lib/payment-gateway.server"),
+        ]);
+        const credentials = await loadPaymentGatewayCredentials(supabaseAdmin);
+        const secret = credentials.stripeWebhookSecret;
         const signature = request.headers.get("stripe-signature");
         if (!secret || !signature) return new Response("Webhook is not configured", { status: 400 });
         const rawBody = await request.text();

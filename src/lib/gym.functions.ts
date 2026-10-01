@@ -93,9 +93,11 @@ export const createRazorpayOrder = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { planId: string; coupon?: string }) => z.object({ planId: z.string().uuid(), coupon: z.string().max(40).optional() }).parse(d))
   .handler(async ({ data, context }) => {
-    const keyId = process.env["RAZORPAY_KEY_ID"]; const secret = process.env["RAZORPAY_KEY_SECRET"];
-    if (!keyId || !secret) throw new Error("Online payments are not switched on yet. Please pay at the front desk or try again later.");
     const db = await admin();
+    const { loadPaymentGatewayCredentials } = await import("@/lib/payment-gateway.server");
+    const credentials = await loadPaymentGatewayCredentials(db);
+    const keyId = credentials.razorpayKeyId; const secret = credentials.razorpayKeySecret;
+    if (!keyId || !secret) throw new Error("Online payments are not switched on yet. Please pay at the front desk or try again later.");
     const { data: gym } = await db.from("gym_settings").select("gym_name, country_code, currency, payment_gateway").order("updated_at", { ascending: false }).limit(1).maybeSingle();
     if (gym?.payment_gateway !== "razorpay" || gym.country_code !== "IN" || gym.currency !== "INR") throw new Error("Razorpay checkout requires India and INR and must be selected in Gym Settings.");
     const { data: profile } = await db.from("profiles").select("onboarding_completed, display_name, email, phone").eq("id", context.userId).single();
@@ -125,17 +127,19 @@ export const verifyRazorpayPayment = createServerFn({ method: "POST" })
     z.object({ orderId: z.string().min(5).max(64), paymentId: z.string().min(5).max(64), signature: z.string().min(10).max(256) }).parse(d),
   )
   .handler(async ({ data, context }) => {
-    const secret = process.env["RAZORPAY_KEY_SECRET"];
+    const db = await admin();
+    const { loadPaymentGatewayCredentials } = await import("@/lib/payment-gateway.server");
+    const credentials = await loadPaymentGatewayCredentials(db);
+    const secret = credentials.razorpayKeySecret;
     if (!secret) throw new Error("Payments not configured.");
     const { createHmac, timingSafeEqual } = await import("node:crypto");
     const expected = createHmac("sha256", secret).update(`${data.orderId}|${data.paymentId}`).digest("hex");
     const a = Buffer.from(expected); const b = Buffer.from(data.signature);
     if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Error("Payment could not be verified.");
-    const db = await admin();
     const { data: pay } = await db.from("payments").select("*").eq("provider_order_id", data.orderId).eq("method", "razorpay").single();
     const { data: member } = await db.from("members").select("id").eq("profile_id", context.userId).single();
     if (!pay || !member || pay.member_id !== member.id) throw new Error("Payment not found.");
-    const keyId = process.env["RAZORPAY_KEY_ID"];
+    const keyId = credentials.razorpayKeyId;
     if (!keyId) throw new Error("Payments not configured.");
     const paymentResponse = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(data.paymentId)}`, {
       headers: { authorization: `Basic ${btoa(`${keyId}:${secret}`)}` },
@@ -157,11 +161,13 @@ export const createStripeCheckout = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { planId: string; coupon?: string }) => z.object({ planId: z.string().uuid(), coupon: z.string().max(40).optional() }).parse(d))
   .handler(async ({ data, context }) => {
-    const secret = process.env["STRIPE_SECRET_KEY"];
-    const appUrl = process.env["APP_URL"] ?? process.env["URL"];
-    if (!secret) throw new Error("Stripe is selected, but STRIPE_SECRET_KEY is not configured on the server.");
-    if (!appUrl) throw new Error("Set APP_URL in the server environment before using Stripe checkout.");
     const db = await admin();
+    const { loadPaymentGatewayCredentials } = await import("@/lib/payment-gateway.server");
+    const credentials = await loadPaymentGatewayCredentials(db);
+    const secret = credentials.stripeSecretKey;
+    const appUrl = process.env["APP_URL"] ?? process.env["URL"];
+    if (!secret) throw new Error("Stripe is selected, but its Secret Key is not configured in Admin Settings.");
+    if (!appUrl) throw new Error("Set APP_URL in the server environment before using Stripe checkout.");
     const { data: gym } = await db.from("gym_settings").select("gym_name, payment_gateway, currency").order("updated_at", { ascending: false }).limit(1).maybeSingle();
     if (gym?.payment_gateway !== "stripe") throw new Error("Stripe is not the active payment gateway. Update Gym Settings first.");
     if (!SUPPORTED_BILLING_CURRENCIES.includes(gym.currency as typeof SUPPORTED_BILLING_CURRENCIES[number])) throw new Error("The selected billing currency is not supported by this checkout.");
@@ -212,9 +218,11 @@ export const verifyStripeCheckout = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: { sessionId: string }) => z.object({ sessionId: z.string().regex(/^cs_(test|live)_[A-Za-z0-9]+$/) }).parse(d))
   .handler(async ({ data, context }) => {
-    const secret = process.env["STRIPE_SECRET_KEY"];
-    if (!secret) throw new Error("Stripe payments are not configured.");
     const db = await admin();
+    const { loadPaymentGatewayCredentials } = await import("@/lib/payment-gateway.server");
+    const credentials = await loadPaymentGatewayCredentials(db);
+    const secret = credentials.stripeSecretKey;
+    if (!secret) throw new Error("Stripe payments are not configured in Admin Settings.");
     const { data: member } = await db.from("members").select("id").eq("profile_id", context.userId).single();
     if (!member) throw new Error("Member record not found.");
     const response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(data.sessionId)}`, {
@@ -365,6 +373,97 @@ export const disconnectGmailOAuth = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { error } = await supabaseAdmin.from("gym_gmail_oauth").delete().eq("id", 1);
     if (error) throw new Error(`Could not disconnect Gmail: ${error.message}`);
+    return { disconnected: true };
+  });
+
+/* ---------------- Admin: payment gateway credentials ---------------- */
+
+const paymentGatewayCredentialsSchema = z.object({
+  provider: z.enum(["razorpay", "stripe"]),
+  keyId: z.string().trim().max(300).optional().default(""),
+  keySecret: z.string().trim().max(1000).optional().default(""),
+  webhookSecret: z.string().trim().max(1000).optional().default(""),
+}).superRefine((data, context) => {
+  if (!data.keyId && !data.keySecret && !data.webhookSecret) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Enter at least one credential to save." });
+  }
+  if (data.provider === "razorpay" && (!data.keyId || !data.keySecret)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Enter both the Razorpay Key ID and Key Secret together." });
+  }
+  if (data.provider === "razorpay" && data.keyId && !/^rzp_(test|live)_[A-Za-z0-9]+$/.test(data.keyId)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["keyId"], message: "Razorpay Key ID should start with rzp_test_ or rzp_live_." });
+  }
+  if (data.provider === "razorpay" && data.keySecret && data.keySecret.length < 8) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["keySecret"], message: "Enter a valid Razorpay Key Secret." });
+  }
+  if (data.provider === "stripe" && data.keyId) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["keyId"], message: "Stripe does not use a publishable key for this server checkout. Enter the Secret Key below." });
+  }
+  if (data.provider === "stripe" && data.keySecret && !/^(sk|rk)_(test|live)_[A-Za-z0-9_]+$/.test(data.keySecret)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["keySecret"], message: "Stripe Secret Key should be an sk_test_, sk_live_, rk_test_, or rk_live_ key." });
+  }
+  if (data.provider === "stripe" && data.webhookSecret && !/^whsec_[A-Za-z0-9_-]+$/.test(data.webhookSecret)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["webhookSecret"], message: "Stripe webhook signing secret should start with whsec_." });
+  }
+  if (data.provider === "razorpay" && data.webhookSecret) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["webhookSecret"], message: "Razorpay credentials do not use the Stripe webhook secret field." });
+  }
+});
+
+export const getPaymentGatewaySettings = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const [{ supabaseAdmin }, { getRequest }, gateway] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@tanstack/react-start/server"),
+      import("@/lib/payment-gateway.server"),
+    ]);
+    const request = getRequest();
+    const baseUrl = process.env["APP_URL"] || process.env["URL"] || (request ? new URL(request.url).origin : "");
+    return {
+      ...await gateway.getPaymentGatewayCredentialStatus(supabaseAdmin),
+      stripeWebhookUrl: baseUrl ? new URL("/api/stripe-webhook", baseUrl).toString() : "",
+    };
+  });
+
+export const savePaymentGatewayCredentials = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof paymentGatewayCredentialsSchema>) => paymentGatewayCredentialsSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const [{ supabaseAdmin }, gateway] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@/lib/payment-gateway.server"),
+    ]);
+    const updates = {
+      id: 1,
+      updated_by: context.userId,
+      updated_at: new Date().toISOString(),
+      ...(data.provider === "razorpay" ? {
+        ...(data.keyId ? { razorpay_key_id_ciphertext: gateway.encryptPaymentSecret(data.keyId) } : {}),
+        ...(data.keySecret ? { razorpay_key_secret_ciphertext: gateway.encryptPaymentSecret(data.keySecret) } : {}),
+      } : {
+        ...(data.keySecret ? { stripe_secret_key_ciphertext: gateway.encryptPaymentSecret(data.keySecret) } : {}),
+        ...(data.webhookSecret ? { stripe_webhook_secret_ciphertext: gateway.encryptPaymentSecret(data.webhookSecret) } : {}),
+      }),
+    };
+    const { error } = await supabaseAdmin.from("gym_payment_gateway_credentials").upsert(updates, { onConflict: "id" });
+    if (error) throw new Error(`Could not save payment gateway credentials: ${error.message}`);
+    return { saved: true, ...(await gateway.getPaymentGatewayCredentialStatus(supabaseAdmin)) };
+  });
+
+export const disconnectPaymentGateway = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { provider: "razorpay" | "stripe" }) => z.object({ provider: z.enum(["razorpay", "stripe"]) }).parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const empty = data.provider === "razorpay"
+      ? { razorpay_key_id_ciphertext: null, razorpay_key_secret_ciphertext: null }
+      : { stripe_secret_key_ciphertext: null, stripe_webhook_secret_ciphertext: null };
+    const { error } = await supabaseAdmin.from("gym_payment_gateway_credentials").update({ ...empty, updated_by: context.userId, updated_at: new Date().toISOString() }).eq("id", 1);
+    if (error) throw new Error(`Could not remove ${data.provider} credentials: ${error.message}`);
     return { disconnected: true };
   });
 

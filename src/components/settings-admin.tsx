@@ -1,11 +1,10 @@
 import { useEffect, useState, type FormEvent, type ChangeEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { CheckCircle2, ExternalLink, ImagePlus, Loader2, Mail, Save, Trash2, Unplug } from "lucide-react";
+import { CheckCircle2, CreditCard, ExternalLink, ImagePlus, Loader2, Mail, Save, Trash2, Unplug } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { getGymSettings, saveGymSettings } from "@/lib/gym.functions";
+import { disconnectPaymentGateway, getGymSettings, getGmailOAuthSettings, getPaymentGatewaySettings, saveGymSettings, savePaymentGatewayCredentials, beginGmailOAuth, disconnectGmailOAuth } from "@/lib/gym.functions";
 import { CURRENCIES, GYM_COUNTRIES, type CountryCode, type CurrencyCode } from "@/lib/currency";
-import { beginGmailOAuth, disconnectGmailOAuth, getGmailOAuthSettings } from "@/lib/gym.functions";
 
 const MAX_LOGO_SIZE = 2 * 1024 * 1024;
 const ACCEPTED_LOGO_TYPES = ["image/png", "image/jpeg", "image/webp"];
@@ -197,7 +196,7 @@ export function SettingsAdmin() {
           <option value="razorpay" disabled={selectedCountry !== "IN"}>Razorpay{selectedCountry === "IN" ? " (recommended for India)" : " (India only; select Stripe outside India)"}</option>
           <option value="stripe">Stripe</option>
         </select>
-        {selectedGateway === "stripe" && <span className="mt-1 block text-xs text-muted-foreground">Configure STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, and APP_URL in the server environment. Register {"/api/stripe-webhook"} in Stripe for checkout.session.completed and checkout.session.async_payment_succeeded events.</span>}
+        <span className="mt-1 block text-xs text-muted-foreground">Configure the selected gateway’s credentials in the integration section below before members check out.</span>
       </label>
 
       <label className="block">
@@ -211,8 +210,84 @@ export function SettingsAdmin() {
         <Button disabled={busy}>{busy ? <Loader2 className="animate-spin" size={16}/> : <Save size={16}/>}Save settings</Button>
       </div>
     </form>
+    <PaymentGatewaySettings />
     <GmailOAuthSettings />
   </section>;
+}
+
+function PaymentGatewaySettings() {
+  const queryClient = useQueryClient();
+  const loadSettings = useServerFn(getPaymentGatewaySettings);
+  const saveCredentials = useServerFn(savePaymentGatewayCredentials);
+  const disconnect = useServerFn(disconnectPaymentGateway);
+  const settings = useQuery({ queryKey: ["payment-gateway-settings"], queryFn: () => loadSettings() });
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  async function save(provider: "razorpay" | "stripe", event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    setBusy(provider); setError(""); setNotice("");
+    try {
+      await saveCredentials({ data: {
+        provider,
+        keyId: String(values.get("keyId") || ""),
+        keySecret: String(values.get("keySecret") || ""),
+        webhookSecret: String(values.get("webhookSecret") || ""),
+      } });
+      form.reset();
+      await queryClient.invalidateQueries({ queryKey: ["payment-gateway-settings"] });
+      setNotice(`${provider === "razorpay" ? "Razorpay" : "Stripe"} credentials saved securely.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save payment gateway credentials.");
+    } finally { setBusy(""); }
+  }
+
+  async function remove(provider: "razorpay" | "stripe") {
+    setBusy(provider); setError(""); setNotice("");
+    try {
+      await disconnect({ data: { provider } });
+      await queryClient.invalidateQueries({ queryKey: ["payment-gateway-settings"] });
+      setNotice(`${provider === "razorpay" ? "Razorpay" : "Stripe"} credentials removed from Settings.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not remove gateway credentials.");
+    } finally { setBusy(""); }
+  }
+
+  if (settings.isLoading) return <div className="mt-8 flex items-center gap-3 border-t border-border pt-6 text-sm text-muted-foreground"><Loader2 className="animate-spin" size={17}/>Loading payment gateway settings…</div>;
+  if (settings.isError || !settings.data) return <div className="mt-8 border-t border-border pt-6"><h3 className="font-semibold">Payment gateway integrations</h3><p className="mt-2 text-sm text-destructive">{settings.error instanceof Error ? settings.error.message : "Could not load payment gateway settings."}</p></div>;
+
+  const current = settings.data;
+  return <div className="mt-8 border-t border-border pt-6">
+    <div className="mb-5 flex items-start gap-3">
+      <span className="grid size-10 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><CreditCard size={19}/></span>
+      <div><h3 className="font-display text-lg font-bold">Payment gateway integrations</h3><p className="mt-1 text-sm text-muted-foreground">Save the API credentials used for member checkout. Credentials are encrypted on the server and never returned to this page.</p></div>
+    </div>
+    {(error || notice) && <p role={error ? "alert" : "status"} className={`mb-4 text-sm ${error ? "text-destructive" : "text-success"}`}>{error || notice}</p>}
+    <div className="grid gap-5 lg:grid-cols-2">
+      <article className="rounded-lg border border-border p-4">
+        <div className="mb-4 flex items-center justify-between gap-3"><h4 className="font-semibold">Razorpay</h4><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${current.razorpayConfigured ? "bg-success-soft text-success" : "bg-muted text-muted-foreground"}`}>{current.razorpayConfigured ? `Connected${current.razorpaySource === "environment" ? " · deployment" : ""}` : "Not connected"}</span></div>
+        <form onSubmit={(event) => save("razorpay", event)} className="space-y-3">
+          <label className="block"><span className="form-label">Razorpay Key ID</span><input name="keyId" type="password" autoComplete="new-password" maxLength={300} required placeholder={current.razorpayConfigured ? "Re-enter Key ID to save or rotate the pair" : "rzp_test_… or rzp_live_…"} className="form-input" /></label>
+          <label className="block"><span className="form-label">Razorpay Key Secret</span><input name="keySecret" type="password" autoComplete="new-password" maxLength={1000} required placeholder={current.razorpayConfigured ? "Re-enter Key Secret to save or rotate the pair" : "Enter the Key Secret"} className="form-input" /></label>
+          <p className="text-xs text-muted-foreground">Razorpay checkout is available for gyms in India using INR. Enter both matching keys together.</p>
+          <div className="flex flex-wrap gap-2"><Button disabled={busy !== ""}>{busy === "razorpay" ? <Loader2 className="animate-spin" size={15}/> : <Save size={15}/>}Save Razorpay keys</Button>{current.razorpaySource === "settings" && <Button type="button" variant="outline" disabled={busy !== ""} onClick={() => void remove("razorpay")}><Unplug size={15}/>Remove saved keys</Button>}</div>
+        </form>
+      </article>
+
+      <article className="rounded-lg border border-border p-4">
+        <div className="mb-4 flex items-center justify-between gap-3"><h4 className="font-semibold">Stripe</h4><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${current.stripeConfigured && current.stripeWebhookConfigured ? "bg-success-soft text-success" : "bg-muted text-muted-foreground"}`}>{current.stripeConfigured && current.stripeWebhookConfigured ? `Connected${current.stripeSource === "environment" || current.stripeWebhookSource === "environment" ? " · deployment" : ""}` : "Needs setup"}</span></div>
+        <form onSubmit={(event) => save("stripe", event)} className="space-y-3">
+          <label className="block"><span className="form-label">Stripe Secret Key</span><input name="keySecret" type="password" autoComplete="new-password" maxLength={1000} required={!current.stripeConfigured} placeholder={current.stripeConfigured ? "Leave blank to keep saved" : "sk_test_… or sk_live_…"} className="form-input" /></label>
+          <label className="block"><span className="form-label">Stripe webhook signing secret</span><input name="webhookSecret" type="password" autoComplete="new-password" maxLength={1000} required={!current.stripeWebhookConfigured} placeholder={current.stripeWebhookConfigured ? "Leave blank to keep saved" : "whsec_…"} className="form-input" /></label>
+          <div className="rounded-md border border-border bg-muted/30 p-3"><span className="text-xs font-semibold">Webhook endpoint URL</span><code className="mt-1 block break-all text-xs">{current.stripeWebhookUrl || "Set APP_URL to display this URL."}</code><span className="mt-1 block text-xs text-muted-foreground">Enable checkout.session.completed and checkout.session.async_payment_succeeded events.</span></div>
+          <div className="flex flex-wrap gap-2"><Button disabled={busy !== ""}>{busy === "stripe" ? <Loader2 className="animate-spin" size={15}/> : <Save size={15}/>}Save Stripe keys</Button>{(current.stripeSource === "settings" || current.stripeWebhookSource === "settings") && <Button type="button" variant="outline" disabled={busy !== ""} onClick={() => void remove("stripe")}><Unplug size={15}/>Remove saved keys</Button>}</div>
+        </form>
+      </article>
+    </div>
+  </div>;
 }
 
 function GmailOAuthSettings() {
