@@ -2,6 +2,14 @@ import { timingSafeEqual } from "node:crypto";
 
 const NETLIFY_API = "https://api.netlify.com/api/v1";
 
+class NetlifyApiError extends Error {
+  constructor(status, path) {
+    super(`Netlify returned HTTP ${status} for ${path}.`);
+    this.status = status;
+    this.path = path;
+  }
+}
+
 function json(statusCode, payload) {
   return new Response(JSON.stringify(payload), {
     status: statusCode,
@@ -30,7 +38,7 @@ async function netlifyRequest(path, init = {}) {
   let data;
   try { data = body ? JSON.parse(body) : null; } catch { data = null; }
   if (!response.ok) {
-    throw new Error(`Netlify API request failed (${response.status}).`);
+    throw new NetlifyApiError(response.status, path);
   }
   return data;
 }
@@ -70,14 +78,16 @@ export default async function handler(request) {
     { key: "SUPABASE_PUBLISHABLE_KEY", value: publishableKey },
     { key: "VITE_SUPABASE_PUBLISHABLE_KEY", value: publishableKey },
     { key: "SUPABASE_PROJECT_ID", value: projectId },
-    { key: "SUPABASE_SERVICE_ROLE_KEY", value: serviceRoleKey, is_secret: true },
+    { key: "SUPABASE_SERVICE_ROLE_KEY", value: serviceRoleKey },
   ];
 
+  let step = "looking up the Netlify project";
   try {
     const site = await netlifyRequest(`/sites/${encodeURIComponent(siteId)}`);
     const accountId = process.env.NETLIFY_ACCOUNT_ID || site.account_slug || site.account_id || site.account?.slug || site.account?.id;
     if (!accountId) throw new Error("Could not determine the Netlify team for this site. Configure NETLIFY_ACCOUNT_ID in the deployment environment.");
     const accountPath = `/accounts/${encodeURIComponent(accountId)}/env`;
+    step = "reading the Netlify environment variables";
     const current = await netlifyRequest(`${accountPath}?site_id=${encodeURIComponent(siteId)}`);
     const existingKeys = new Map((Array.isArray(current) ? current : []).map((item) => [item.key, item]));
     const newVariables = [];
@@ -87,32 +97,35 @@ export default async function handler(request) {
       const body = {
         key: variable.key,
         values: [{ context: "all", value: variable.value }],
-        is_secret: Boolean(variable.is_secret),
       };
-      if (prior?.scopes?.length) body.scopes = prior.scopes;
       if (prior) {
+        step = `updating ${variable.key}`;
         await netlifyRequest(`${accountPath}/${encodeURIComponent(variable.key)}?site_id=${encodeURIComponent(siteId)}`, {
           method: "PUT",
           body: JSON.stringify(body),
         });
       } else {
+        step = `creating ${variable.key}`;
         newVariables.push(body);
       }
     }
 
     if (newVariables.length) {
+      step = "creating the remaining Netlify environment variables";
       await netlifyRequest(`${accountPath}?site_id=${encodeURIComponent(siteId)}`, {
         method: "POST",
         body: JSON.stringify(newVariables),
       });
     }
 
+    step = "queueing the Netlify deployment";
     await netlifyRequest(`/sites/${encodeURIComponent(siteId)}/builds`, { method: "POST" });
     return json(200, { ok: true, message: "Credentials were saved and a new deployment was queued." });
   } catch (error) {
     // Do not log submitted credentials, setup codes, or raw API request bodies.
-    const message = error instanceof Error ? error.message : "Unexpected Netlify API error.";
-    console.error("[Supabase setup] Could not update the Netlify environment:", message);
-    return json(502, { error: "Could not save the database connection in Netlify. Check the Netlify setup token, site and account IDs, and environment-variable permissions." });
+    const detail = error instanceof Error ? error.message : "Unexpected Netlify API error.";
+    console.error("[Supabase setup] Could not update the Netlify environment:", detail);
+    const status = error instanceof NetlifyApiError ? ` Netlify returned HTTP ${error.status}.` : "";
+    return json(502, { error: `Could not save the database connection while ${step}.${status} Check the Netlify token, account/site IDs, and permissions.` });
   }
 }
