@@ -61,7 +61,7 @@ export function Dashboard({ name = "Admin" }: { name?: string }) {
       </div>
       <nav className="flex-1 space-y-1 overflow-y-auto p-3" aria-label="Main navigation">
         <p className="px-3 pb-2 pt-3 text-[11px] font-bold uppercase text-sidebar-muted">Operations</p>
-        {nav.map(([label, Icon]) => <button key={label} onClick={()=>{setActive(label);setMobileOpen(false)}} className={cn("flex h-11 w-full items-center gap-3 rounded-md px-3 text-sm font-medium transition-colors", active===label ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-sidebar-muted hover:bg-sidebar-hover hover:text-sidebar-foreground")}><Icon size={18}/><span>{label}</span>{active===label && <ChevronRight className="ml-auto" size={15}/>}</button>)}
+        {nav.map(([label, Icon]) => <button key={label} onClick={()=>{setActive(label);setMobileOpen(false)}} className={cn("flex h-11 w-full items-center gap-3 rounded-md px-3 text-sm font-medium transition-colors", active===label ? "sidebar-active-glass text-primary" : "text-sidebar-muted hover:bg-sidebar-hover hover:text-sidebar-foreground")}><Icon size={18}/><span>{label}</span>{active===label && <ChevronRight className="ml-auto" size={15}/>}</button>)}
       </nav>
       <div className="border-t border-sidebar-border p-4"><div className="flex items-center gap-3"><span className="grid size-9 place-items-center rounded-full bg-primary font-bold text-primary-foreground">{initials}</span><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{name}</p><p className="text-xs text-sidebar-muted">Administrator</p></div><button aria-label="Sign out" onClick={signOut}><LogOut size={17} className="text-sidebar-muted hover:text-sidebar-foreground"/></button></div></div>
     </aside>
