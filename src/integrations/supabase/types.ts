@@ -532,6 +532,30 @@ export type Database = {
         }
         Relationships: []
       }
+      gym_send_email_auth_hook: {
+        Row: {
+          configured_at: string | null
+          enabled: boolean
+          id: number
+          updated_at: string
+          updated_by: string | null
+        }
+        Insert: {
+          configured_at?: string | null
+          enabled?: boolean
+          id?: number
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Update: {
+          configured_at?: string | null
+          enabled?: boolean
+          id?: number
+          updated_at?: string
+          updated_by?: string | null
+        }
+        Relationships: []
+      }
       gym_settings: {
         Row: {
           address: string | null

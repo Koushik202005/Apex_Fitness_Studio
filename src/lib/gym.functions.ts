@@ -371,9 +371,155 @@ export const disconnectGmailOAuth = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     await requireAdmin(context);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: authHook } = await supabaseAdmin.from("gym_send_email_auth_hook").select("enabled").eq("id", 1).maybeSingle();
+    if (authHook?.enabled) throw new Error("Disable the Send Email Auth Hook before disconnecting Gmail. Supabase Auth is currently using this Gmail account for member verification emails.");
     const { error } = await supabaseAdmin.from("gym_gmail_oauth").delete().eq("id", 1);
     if (error) throw new Error(`Could not disconnect Gmail: ${error.message}`);
     return { disconnected: true };
+  });
+
+/* ---------------- Admin: Supabase Send Email Auth Hook ---------------- */
+
+const sendEmailHookSetupSchema = z.object({
+  accessToken: z.string().trim().min(20).max(500),
+  enabled: z.boolean(),
+});
+
+function supabaseProjectDetails() {
+  const rawUrl = process.env["SUPABASE_URL"];
+  if (!rawUrl) throw new Error("The server Supabase URL is not configured.");
+  let url: URL;
+  try { url = new URL(rawUrl); }
+  catch { throw new Error("The server Supabase URL is invalid."); }
+  const match = url.hostname.match(/^([a-z0-9-]+)\.supabase\.co$/i);
+  if (url.protocol !== "https:" || !match) throw new Error("Automatic hook setup requires a hosted Supabase project URL ending in .supabase.co.");
+  const projectRef = match[1]!;
+  return {
+    projectRef,
+    projectUrl: `https://${projectRef}.supabase.co`,
+    functionUrl: `https://${projectRef}.supabase.co/functions/v1/send-email`,
+  };
+}
+
+async function managementApiRequest(path: string, accessToken: string, init?: RequestInit) {
+  const headers = new Headers(init?.headers);
+  headers.set("Authorization", `Bearer ${accessToken}`);
+  if (init?.body) headers.set("Content-Type", "application/json");
+  const response = await fetch(`https://api.supabase.com/v1${path}`, {
+    ...init,
+    headers,
+    signal: AbortSignal.timeout(12_000),
+  });
+  const bodyText = await response.text();
+  let body: unknown = null;
+  try { body = bodyText ? JSON.parse(bodyText) : null; } catch { body = bodyText; }
+  if (!response.ok) {
+    const detail = typeof body === "object" && body !== null && "message" in body && typeof body.message === "string"
+      ? body.message
+      : typeof body === "object" && body !== null && "error" in body && typeof body.error === "string"
+        ? body.error
+        : "";
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Supabase rejected this access token. Use a project-scoped token with Auth Config read/write, Project Admin write, and Edge Function Secrets write permissions.");
+    }
+    throw new Error(detail.slice(0, 240) || `Supabase setup request failed (HTTP ${response.status}).`);
+  }
+  return body;
+}
+
+export const getSendEmailAuthHookSettings = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data, error } = await supabaseAdmin.from("gym_send_email_auth_hook")
+      .select("enabled, configured_at, updated_at")
+      .eq("id", 1)
+      .maybeSingle();
+    if (error) throw new Error(`Could not load email authentication settings: ${error.message}`);
+    const project = supabaseProjectDetails();
+    return {
+      enabled: Boolean(data?.enabled),
+      configuredAt: data?.configured_at ?? null,
+      updatedAt: data?.updated_at ?? null,
+      functionUrl: project.functionUrl,
+    };
+  });
+
+export const configureSendEmailAuthHook = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof sendEmailHookSetupSchema>) => sendEmailHookSetupSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const [{ supabaseAdmin }, oauth] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@/lib/gmail-oauth.server"),
+    ]);
+    const project = supabaseProjectDetails();
+    const token = data.accessToken.trim();
+    const currentRow = await oauth.readGmailOAuthRow(supabaseAdmin);
+    const wasGmailConfigured = Boolean(currentRow?.refresh_token_ciphertext && currentRow.sender_email);
+    if (data.enabled && !wasGmailConfigured) {
+      throw new Error("Connect and authorize Gmail in Admin Settings before enabling the Send Email Auth Hook.");
+    }
+
+    const currentSettings = await managementApiRequest(`/projects/${project.projectRef}/config/auth`, token) as {
+      external_email_enabled?: boolean;
+      hook_send_email_enabled?: boolean;
+      hook_send_email_uri?: string;
+    };
+    const hookIsOurEndpoint = currentSettings.hook_send_email_uri === project.functionUrl;
+    if (data.enabled && currentSettings.hook_send_email_enabled && !hookIsOurEndpoint) {
+      throw new Error("A different Send Email Auth Hook is already enabled for this Supabase project. Disable or replace it in Supabase first.");
+    }
+    if (!data.enabled && currentSettings.hook_send_email_enabled && !hookIsOurEndpoint) {
+      throw new Error("A different Send Email Auth Hook is enabled. This app will not change another hook’s configuration.");
+    }
+    if (data.enabled && currentSettings.external_email_enabled === false) {
+      throw new Error("Email authentication is disabled in Supabase. Enable the Email provider before configuring this hook.");
+    }
+
+    if (data.enabled) {
+      const functionResponse = await fetch(project.functionUrl, { method: "GET", signal: AbortSignal.timeout(5_000) });
+      if (functionResponse.status !== 405) {
+        throw new Error("The send-email function is not deployed yet. Deploy it from the GitHub Actions workflow, then retry.");
+      }
+
+      const { randomBytes } = await import("node:crypto");
+      const hookSecret = `v1,whsec_${randomBytes(32).toString("base64")}`;
+      const secrets = [{ name: "SEND_EMAIL_HOOK_SECRET", value: hookSecret }];
+      const encryptionKey = process.env["GMAIL_CREDENTIALS_ENCRYPTION_KEY"];
+      if (encryptionKey) secrets.push({ name: "GMAIL_CREDENTIALS_ENCRYPTION_KEY", value: encryptionKey });
+
+      await managementApiRequest(`/projects/${project.projectRef}/secrets`, token, {
+        method: "POST",
+        body: JSON.stringify(secrets),
+      });
+      await managementApiRequest(`/projects/${project.projectRef}/config/auth`, token, {
+        method: "PATCH",
+        body: JSON.stringify({
+          hook_send_email_enabled: true,
+          hook_send_email_uri: project.functionUrl,
+          hook_send_email_secrets: hookSecret,
+        }),
+      });
+    } else {
+      await managementApiRequest(`/projects/${project.projectRef}/config/auth`, token, {
+        method: "PATCH",
+        body: JSON.stringify({ hook_send_email_enabled: false }),
+      });
+    }
+
+    const now = new Date().toISOString();
+    const { error } = await supabaseAdmin.from("gym_send_email_auth_hook").upsert({
+      id: 1,
+      enabled: data.enabled,
+      configured_at: data.enabled ? now : null,
+      updated_by: context.userId,
+      updated_at: now,
+    }, { onConflict: "id" });
+    if (error) throw new Error(`Supabase hook updated, but its status could not be saved: ${error.message}`);
+    return { enabled: data.enabled, functionUrl: project.functionUrl };
   });
 
 /* ---------------- Admin: payment gateway credentials ---------------- */

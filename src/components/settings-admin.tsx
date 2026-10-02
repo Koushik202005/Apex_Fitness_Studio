@@ -1,9 +1,9 @@
 import { useEffect, useState, type FormEvent, type ChangeEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { CheckCircle2, CreditCard, ExternalLink, ImagePlus, Loader2, Mail, Save, Trash2, Unplug } from "lucide-react";
+import { CheckCircle2, CreditCard, ExternalLink, ImagePlus, Loader2, Mail, Save, Trash2, Unplug, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { disconnectPaymentGateway, getGymSettings, getGmailOAuthSettings, getPaymentGatewaySettings, saveGymSettings, savePaymentGatewayCredentials, beginGmailOAuth, disconnectGmailOAuth } from "@/lib/gym.functions";
+import { configureSendEmailAuthHook, disconnectPaymentGateway, getGymSettings, getGmailOAuthSettings, getPaymentGatewaySettings, getSendEmailAuthHookSettings, saveGymSettings, savePaymentGatewayCredentials, beginGmailOAuth, disconnectGmailOAuth } from "@/lib/gym.functions";
 import { CURRENCIES, GYM_COUNTRIES, type CountryCode, type CurrencyCode } from "@/lib/currency";
 
 const MAX_LOGO_SIZE = 2 * 1024 * 1024;
@@ -212,6 +212,7 @@ export function SettingsAdmin() {
     </form>
     <PaymentGatewaySettings />
     <GmailOAuthSettings />
+    <SendEmailAuthHookSettings />
   </section>;
 }
 
@@ -371,6 +372,74 @@ function GmailOAuthSettings() {
       <div className="flex flex-wrap items-center gap-3">
         <Button disabled={busy}>{busy ? <Loader2 className="animate-spin" size={16}/> : <ExternalLink size={16}/>} {current.configured ? "Reconnect Gmail" : "Save credentials and connect Gmail"}</Button>
         <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer" className="text-sm font-semibold text-primary hover:underline">Open Google Cloud credentials <ExternalLink className="inline" size={13}/></a>
+      </div>
+    </form>
+  </div>;
+}
+
+function SendEmailAuthHookSettings() {
+  const queryClient = useQueryClient();
+  const loadSettings = useServerFn(getSendEmailAuthHookSettings);
+  const loadOAuthSettings = useServerFn(getGmailOAuthSettings);
+  const configureHook = useServerFn(configureSendEmailAuthHook);
+  const oauthSettings = useQuery({ queryKey: ["gmail-oauth-settings"], queryFn: () => loadOAuthSettings() });
+  const hookSettings = useQuery({ queryKey: ["send-email-auth-hook-settings"], queryFn: () => loadSettings() });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  async function submit(event: FormEvent<HTMLFormElement>, enabled: boolean) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const accessToken = String(new FormData(form).get("supabaseAccessToken") || "");
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await configureHook({ data: { accessToken, enabled } });
+      form.reset();
+      await queryClient.invalidateQueries({ queryKey: ["send-email-auth-hook-settings"] });
+      setNotice(enabled
+        ? "Member authentication emails will now be sent through the connected Gmail account."
+        : "The hook is disabled. Supabase will use its built-in email sender again.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update the Send Email Auth Hook.");
+    } finally { form.reset(); setBusy(false); }
+  }
+
+  if (hookSettings.isLoading || oauthSettings.isLoading) {
+    return <div className="mt-8 flex items-center gap-3 border-t border-border pt-6 text-sm text-muted-foreground"><Loader2 className="animate-spin" size={17}/>Loading authentication email setup…</div>;
+  }
+  if (hookSettings.isError || !hookSettings.data || oauthSettings.isError || !oauthSettings.data) {
+    return <div className="mt-8 border-t border-border pt-6"><h3 className="font-semibold">Member authentication emails</h3><p className="mt-2 text-sm text-destructive">Could not load the Send Email Auth Hook settings.</p></div>;
+  }
+
+  const current = hookSettings.data;
+  const gmailConnected = oauthSettings.data.configured;
+  return <div className="mt-8 border-t border-border pt-6">
+    <div className="mb-5 flex items-start gap-3">
+      <span className="grid size-10 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><ShieldCheck size={19}/></span>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2"><h3 className="font-display text-lg font-bold">Member authentication emails</h3><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${current.enabled ? "bg-success-soft text-success" : "bg-muted text-muted-foreground"}`}>{current.enabled ? "Custom sender active" : "Supabase sender active"}</span></div>
+        <p className="mt-1 text-sm text-muted-foreground">After setup, member verification, password reset, invite, and other Supabase Auth emails will be sent by the Gmail account above. The first admin can register with Supabase’s built-in email before enabling this.</p>
+      </div>
+    </div>
+    <div className="mb-4 rounded-md border border-border bg-muted/30 p-4 text-sm">
+      <p className="font-semibold">One-time setup requirements</p>
+      <ol className="mt-2 list-decimal space-y-1 pl-5 text-muted-foreground">
+        <li>Connect Gmail above and make sure the <code>send-email</code> Edge Function has been deployed from GitHub.</li>
+        <li>Create a Supabase project-scoped personal access token with <strong>Auth Config read and write</strong>, <strong>Project Admin write</strong>, and <strong>Edge Function Secrets write</strong> permissions.</li>
+        <li>Enter the token below. It is sent only to the server for this setup request and is not saved.</li>
+      </ol>
+      <a href="https://supabase.com/dashboard/account/tokens" target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 font-semibold text-primary hover:underline">Create a Supabase access token <ExternalLink size={13}/></a>
+    </div>
+    <form onSubmit={(event) => void submit(event, !current.enabled)} className="max-w-2xl space-y-3">
+      <label className="block"><span className="form-label">Supabase personal access token</span><input name="supabaseAccessToken" type="password" required minLength={20} maxLength={500} autoComplete="new-password" className="form-input" placeholder="Paste a scoped Supabase token"/><span className="mt-1 block text-xs text-muted-foreground">The token is never stored in the database. Re-enter it whenever you enable or disable the hook.</span></label>
+      <div className="rounded-md border border-border bg-muted/30 p-3"><span className="text-xs font-semibold">Send Email Hook endpoint</span><code className="mt-1 block break-all text-xs">{current.functionUrl}</code></div>
+      {(error || notice) && <p role={error ? "alert" : "status"} className={`text-sm ${error ? "text-destructive" : "text-success"}`}>{error || notice}</p>}
+      <div className="flex flex-wrap gap-2">
+        {!current.enabled
+          ? <Button disabled={busy || !gmailConnected}>{busy ? <Loader2 className="animate-spin" size={15}/> : <ShieldCheck size={15}/>}Enable custom auth emails</Button>
+          : <Button variant="outline" disabled={busy}>{busy ? <Loader2 className="animate-spin" size={15}/> : <Unplug size={15}/>}Disable and use Supabase email</Button>}
+        {!gmailConnected && <span className="self-center text-xs text-warning">Connect Gmail before enabling.</span>}
       </div>
     </form>
   </div>;
