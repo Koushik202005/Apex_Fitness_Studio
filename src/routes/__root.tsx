@@ -137,6 +137,32 @@ function BrandingSync({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
 
   useEffect(() => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const finePointer = window.matchMedia("(pointer: fine)");
+    if (reducedMotion.matches || !finePointer.matches) return;
+
+    let frame = 0;
+    const onPointerMove = (event: PointerEvent) => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        document.documentElement.style.setProperty("--pointer-x", `${event.clientX}px`);
+        document.documentElement.style.setProperty("--pointer-y", `${event.clientY}px`);
+        document.body.dataset.cursorGlow = "true";
+        frame = 0;
+      });
+    };
+
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      if (frame) window.cancelAnimationFrame(frame);
+      delete document.body.dataset.cursorGlow;
+      document.documentElement.style.removeProperty("--pointer-x");
+      document.documentElement.style.removeProperty("--pointer-y");
+    };
+  }, []);
+
+  useEffect(() => {
     if (!branding) return;
     document.title = branding.app_title;
     document.documentElement.dataset.theme = branding.color_theme;
