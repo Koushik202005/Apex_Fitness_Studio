@@ -5,40 +5,15 @@ import { CreditCard, Fingerprint, Loader2, Nfc, Radio, ShieldAlert, UserRound, X
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import { checkInWithNfcCard, registerNfcMemberCard, revokeNfcMemberCard } from "@/lib/gym.functions";
-
-type NdefRecordLike = { recordType: string; data: DataView | string | ArrayBuffer | null };
-type NdefReaderLike = {
-  onreading: ((event: { message: { records: NdefRecordLike[] } }) => void) | null;
-  onreadingerror: (() => void) | null;
-  scan(options?: { signal?: AbortSignal }): Promise<void>;
-  write(message: { records: Array<{ recordType: "text"; data: string }> }): Promise<void>;
-};
+import { scanMemberNfcToken, writeMemberNfcToken } from "@/lib/nfc-platform";
 type MemberRow = { id: string; member_code: string; status: string; profiles: { display_name: string | null } | null };
 type CredentialRow = { id: string; member_id: string; label: string | null; active: boolean; registered_at: string; members: { member_code: string; profiles: { display_name: string | null } | null } | null };
-
-function getNdefReader() {
-  const Constructor = (window as Window & { NDEFReader?: new () => NdefReaderLike }).NDEFReader;
-  if (!window.isSecureContext || !Constructor) throw new Error("NFC requires an HTTPS page in a supported Android Chrome browser.");
-  return new Constructor();
-}
 
 function makeCardToken() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   let binary = "";
   bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function readNfcToken(records: NdefRecordLike[]) {
-  for (const record of records) {
-    if (record.recordType !== "text" || !record.data) continue;
-    const value = typeof record.data === "string"
-      ? record.data
-      : new TextDecoder().decode(record.data instanceof DataView ? record.data : new DataView(record.data));
-    const token = value.startsWith("FGYM1:") ? value.slice(6).trim() : "";
-    if (/^[A-Za-z0-9_-]{43}$/.test(token)) return token;
-  }
-  throw new Error("This card has no valid GYM MANAGER check-in record. Register the card first.");
 }
 
 export function NfcAttendanceAdmin() {
@@ -51,7 +26,6 @@ export function NfcAttendanceAdmin() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const [scanController, setScanController] = useState<AbortController | null>(null);
 
   const members = useQuery({
     queryKey: ["nfc-admin-members"],
@@ -76,9 +50,8 @@ export function NfcAttendanceAdmin() {
     if (!memberId) { setError("Choose a member first."); return; }
     setBusy("register"); setError(""); setMessage("");
     try {
-      const reader = getNdefReader();
       const token = makeCardToken();
-      await reader.write({ records: [{ recordType: "text", data: `FGYM1:${token}` }] });
+      await writeMemberNfcToken(token);
       await registerCard({ data: { memberId, token, label: label.trim() || "NFC card" } });
       setMessage("NFC card registered. The member can tap it at the gym check-in station.");
       await queryClient.invalidateQueries({ queryKey: ["nfc-admin-credentials"] });
@@ -88,37 +61,18 @@ export function NfcAttendanceAdmin() {
   }
 
   async function startScan() {
-    setBusy("scan"); setError(""); setMessage("Hold the NFC card against this device to record today's attendance.");
+    setBusy("scan"); setError(""); setMessage("Follow the phone's NFC prompt, then hold the card near the phone to record today's attendance.");
     try {
-      const reader = getNdefReader();
-      const controller = new AbortController();
-      setScanController(controller);
-      reader.onreadingerror = () => {
-        controller.abort(); setScanController(null); setBusy("");
-        setError("The NFC tag could not be read. Try holding it against the device again.");
-      };
-      reader.onreading = (event) => {
-        controller.abort(); setScanController(null);
-        void (async () => {
-          try {
-            const token = readNfcToken(event.message.records);
-            const result = await checkIn({ data: { token } });
-            if (result.decision === "granted") {
-              setMessage(result.attendanceRecorded
-                ? `Check-in recorded for ${result.memberName || result.memberCode || "member"}.`
-                : `${result.memberName || result.memberCode || "Member"}: ${result.reason}`);
-            } else setError(`${result.memberName || result.memberCode || "Check-in denied"}: ${result.reason}`);
-          } catch (cause) {
-            setError(cause instanceof Error ? cause.message : "Could not verify this NFC card.");
-          } finally { setBusy(""); }
-        })();
-      };
-      await reader.scan({ signal: controller.signal });
+      const token = await scanMemberNfcToken();
+      const result = await checkIn({ data: { token } });
+      if (result.decision === "granted") {
+        setMessage(result.attendanceRecorded
+          ? `Check-in recorded for ${result.memberName || result.memberCode || "member"}.`
+          : `${result.memberName || result.memberCode || "Member"}: ${result.reason}`);
+      } else setError(`${result.memberName || result.memberCode || "Check-in denied"}: ${result.reason}`);
     } catch (cause) {
-      setScanController(null); setBusy("");
-      if (cause instanceof Error && cause.name === "AbortError") return;
       setError(cause instanceof Error ? cause.message : "Could not start the NFC scanner.");
-    }
+    } finally { setBusy(""); }
   }
 
   async function revoke(id: string, memberName: string) {
@@ -138,12 +92,12 @@ export function NfcAttendanceAdmin() {
     <section className="panel p-5 md:p-7">
       <div className="mb-5 flex items-start gap-3 border-b border-border pb-5">
         <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary"><Nfc size={22}/></span>
-        <div><h2 className="section-title">Member check-in credentials</h2><p className="section-subtitle">Register NFC cards and run attendance check-in from an Android NFC-enabled device.</p></div>
+        <div><h2 className="section-title">Member check-in credentials</h2><p className="section-subtitle">Register NFC cards and scan attendance from a supported NFC-enabled Android browser.</p></div>
       </div>
       <div className="grid gap-5 lg:grid-cols-2">
         <div className="rounded-xl border border-border p-4">
           <h3 className="flex items-center gap-2 font-semibold"><CreditCard size={17}/> Register an NFC card</h3>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">Select a member, then hold a writable NFC tag to the Android device when prompted. Registration replaces the tag's current NDEF contents.</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">Select a member, then hold a writable NDEF-compatible NFC card/tag near the Android device when prompted. Registration replaces its current NDEF contents.</p>
           <label className="mt-4 block"><span className="form-label">Member</span><select className="form-input" value={memberId} onChange={(event) => setMemberId(event.target.value)}>
             <option value="">Select a member</option>{activeMembers.map((member) => <option key={member.id} value={member.id}>{member.profiles?.display_name || "Member"} · {member.member_code}</option>)}
           </select></label>
@@ -153,11 +107,11 @@ export function NfcAttendanceAdmin() {
         </div>
         <div className="rounded-xl border border-border p-4">
           <h3 className="flex items-center gap-2 font-semibold"><Radio size={17}/> Daily attendance check-in</h3>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">Use this on a staff-supervised Android check-in station. A valid member card records one attendance check-in per gym-local day.</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">Use a supported Android browser and NFC check-in station. A valid member card records one attendance check-in per gym-local day.</p>
           <div className="mt-6 flex min-h-24 flex-col items-center justify-center rounded-xl border border-dashed border-primary/40 bg-primary/5 px-4 text-center">
             <Nfc size={27} className="text-primary"/>
             <p className="mt-2 text-sm font-medium">{busy === "scan" ? "Ready to scan a card…" : "Tap a member card to check in"}</p>
-            {busy === "scan" ? <Button className="mt-3" variant="outline" onClick={() => { scanController?.abort(); setScanController(null); setBusy(""); setMessage(""); }}>Cancel scan</Button>
+            {busy === "scan" ? <Button className="mt-3" variant="outline" disabled><Loader2 className="animate-spin" size={16}/>Waiting for card…</Button>
               : <Button className="mt-3" variant="outline" disabled={Boolean(busy)} onClick={() => void startScan()}><Nfc size={16}/>Start NFC scanner</Button>}
           </div>
           <p className="mt-3 flex items-start gap-2 text-xs leading-5 text-muted-foreground"><ShieldAlert size={15} className="mt-0.5 shrink-0"/>Card contents are a bearer credential. Keep cards supervised; anyone holding a card can present it. Revoking a card disables it immediately.</p>
@@ -176,6 +130,6 @@ export function NfcAttendanceAdmin() {
       </div>
     </section>
 
-    <section className="panel flex gap-3 p-4 text-sm text-muted-foreground"><Fingerprint size={18} className="mt-0.5 shrink-0 text-primary"/><p><b className="text-foreground">Fingerprint devices:</b> a normal web browser cannot enroll or read raw fingerprints. To use fingerprint check-in, connect a biometric terminal and use its supported SDK/API integration. This NFC workflow is available without a dedicated biometric machine.</p></section>
+    <section className="panel flex gap-3 p-4 text-sm text-muted-foreground"><Fingerprint size={18} className="mt-0.5 shrink-0 text-primary"/><p><b className="text-foreground">Fingerprint devices:</b> a normal web browser cannot enroll or read raw fingerprints. To use fingerprint check-in, connect a biometric terminal and use its supported SDK/API integration.</p></section>
   </div>;
 }

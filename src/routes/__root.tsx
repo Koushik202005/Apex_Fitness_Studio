@@ -8,7 +8,7 @@ import {
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 
@@ -133,8 +133,14 @@ function RootComponent() {
 
 function BrandingSync({ children }: { children: ReactNode }) {
   const loadBranding = useServerFn(getGymBranding);
-  const { data: branding } = useQuery({ queryKey: ["gym-branding"], queryFn: () => loadBranding() });
+  const { data: branding, isPending } = useQuery({ queryKey: ["gym-branding"], queryFn: () => loadBranding(), retry: false });
   const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const [minimumSplashElapsed, setMinimumSplashElapsed] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setMinimumSplashElapsed(true), 2000);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -175,5 +181,42 @@ function BrandingSync({ children }: { children: ReactNode }) {
     icon.href = branding.logo_url || "data:,";
   }, [branding?.app_title, branding?.color_theme, branding?.logo_url, pathname]);
 
+  if (isPending || !minimumSplashElapsed) return <SetupInitializing branding={branding} />;
+
   return <CurrencyContext.Provider value={branding?.currency ?? "INR"}>{children}</CurrencyContext.Provider>;
+}
+
+function SetupInitializing({ branding }: { branding?: { gym_name?: string | null; logo_url?: string | null } }) {
+  return (
+    <main
+      role="status"
+      aria-live="polite"
+      aria-label="Initializing gym workspace"
+      className="fixed inset-0 z-[100] grid min-h-screen place-items-center overflow-hidden bg-background px-6 text-foreground"
+    >
+      <div className="pointer-events-none absolute -left-24 -top-24 size-72 rounded-full bg-primary/10 blur-3xl" />
+      <div className="pointer-events-none absolute -bottom-28 -right-20 size-80 rounded-full bg-primary/10 blur-3xl" />
+      <div className="relative flex flex-col items-center text-center">
+        <div className="relative grid size-32 place-items-center">
+          <span className="absolute inset-0 rounded-full border border-primary/20" />
+          <span className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-primary border-r-primary/50" />
+          <span className="absolute inset-2 animate-[spin_3.2s_linear_infinite_reverse] rounded-full border border-dashed border-primary/25" />
+          <span className="grid size-20 place-items-center overflow-hidden rounded-2xl border border-white/10 bg-card/85 p-3 shadow-xl shadow-primary/10 backdrop-blur-xl">
+            {branding?.logo_url ? (
+              <img src={branding.logo_url} alt="" className="size-full object-contain" />
+            ) : (
+              <span className="text-center font-display text-[10px] font-black leading-tight text-primary">GYM<br />MANAGER</span>
+            )}
+          </span>
+        </div>
+        <p className="mt-7 font-display text-lg font-bold uppercase tracking-[0.16em]">
+          {branding?.gym_name || "GYM MANAGER"}
+        </p>
+        <p className="mt-2 text-sm text-muted-foreground">Preparing your gym workspace</p>
+        <div className="mt-6 h-1 w-44 overflow-hidden rounded-full bg-muted">
+          <span className="block h-full w-2/5 animate-[forge-loading-shimmer_1.15s_ease-in-out_infinite] rounded-full bg-primary" />
+        </div>
+      </div>
+    </main>
+  );
 }
