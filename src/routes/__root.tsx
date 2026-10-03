@@ -109,6 +109,11 @@ function RootShell({ children }: { children: ReactNode }) {
     <html lang="en">
       <head>
         <HeadContent />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `try{const b=JSON.parse(localStorage.getItem("gym-branding-cache")||"null");if(b&&["forge-green","ocean-blue","ember-orange","violet","rose"].includes(b.color_theme))document.documentElement.dataset.theme=b.color_theme}catch{}`,
+          }}
+        />
       </head>
       <body>
         {children}
@@ -136,6 +141,47 @@ function BrandingSync({ children }: { children: ReactNode }) {
   const { data: branding, isPending } = useQuery({ queryKey: ["gym-branding"], queryFn: () => loadBranding(), retry: false });
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const [minimumSplashElapsed, setMinimumSplashElapsed] = useState(false);
+  const [cachedBranding, setCachedBranding] = useState<{
+    gym_name: string;
+    logo_url: string | null;
+    app_title: string;
+    color_theme: string;
+  }>();
+
+  useEffect(() => {
+    try {
+      const cached = localStorage.getItem("gym-branding-cache");
+      if (!cached) return;
+      const value = JSON.parse(cached) as Partial<NonNullable<typeof cachedBranding>>;
+      if (typeof value.color_theme !== "string" || !["forge-green", "ocean-blue", "ember-orange", "violet", "rose"].includes(value.color_theme)) return;
+      setCachedBranding({
+        gym_name: typeof value.gym_name === "string" ? value.gym_name : "GYM MANAGER",
+        logo_url: typeof value.logo_url === "string" ? value.logo_url : null,
+        app_title: typeof value.app_title === "string" ? value.app_title : "GYM MANAGER",
+        color_theme: value.color_theme,
+      });
+    } catch {
+      try {
+        localStorage.removeItem("gym-branding-cache");
+      } catch {
+        // Ignore browser storage restrictions.
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!branding) return;
+    try {
+      localStorage.setItem("gym-branding-cache", JSON.stringify({
+        gym_name: branding.gym_name,
+        logo_url: branding.logo_url,
+        app_title: branding.app_title,
+        color_theme: branding.color_theme,
+      }));
+    } catch {
+      // The live branding response still applies when browser storage is unavailable.
+    }
+  }, [branding]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setMinimumSplashElapsed(true), 2000);
@@ -168,20 +214,22 @@ function BrandingSync({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const effectiveBranding = branding ?? cachedBranding;
+
   useEffect(() => {
-    if (!branding) return;
-    document.title = branding.app_title;
-    document.documentElement.dataset.theme = branding.color_theme;
+    if (!effectiveBranding) return;
+    document.title = effectiveBranding.app_title;
+    document.documentElement.dataset.theme = effectiveBranding.color_theme;
     let icon = document.querySelector<HTMLLinkElement>('link[rel~="icon"]');
     if (!icon) {
       icon = document.createElement("link");
       icon.rel = "icon";
       document.head.append(icon);
     }
-    icon.href = branding.logo_url || "data:,";
-  }, [branding?.app_title, branding?.color_theme, branding?.logo_url, pathname]);
+    icon.href = effectiveBranding.logo_url || "data:,";
+  }, [effectiveBranding?.app_title, effectiveBranding?.color_theme, effectiveBranding?.logo_url, pathname]);
 
-  if (isPending || !minimumSplashElapsed) return <SetupInitializing branding={branding} />;
+  if (isPending || !minimumSplashElapsed) return <SetupInitializing branding={effectiveBranding} />;
 
   return <CurrencyContext.Provider value={branding?.currency ?? "INR"}>{children}</CurrencyContext.Provider>;
 }
