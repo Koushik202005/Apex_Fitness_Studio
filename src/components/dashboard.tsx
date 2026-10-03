@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import {
-  Activity, Bell, CalendarDays, CheckCircle2, ChevronRight, CircleDollarSign, Clock3, CreditCard,
+  Activity, Archive, Bell, CalendarDays, CheckCircle2, ChevronRight, CircleDollarSign, Clock3, CreditCard,
   Fingerprint, LayoutDashboard, Loader2, LogOut, Mail, Menu, Search, Settings, ShieldCheck,
   TrendingUp, UserRoundPlus, UserX, Users, WalletCards, X,
 } from "lucide-react";
@@ -16,6 +16,8 @@ import { SettingsAdmin } from "@/components/settings-admin";
 import { getExpiringMembers, getGymBranding, sendExpiringMemberReminder } from "@/lib/gym.functions";
 import { useAdminDashboardData } from "@/components/admin-dashboard-data";
 import { ClassesAdmin } from "@/components/classes-admin";
+import { DataArchiveAdmin } from "@/components/data-archive-admin";
+import { NfcAttendanceAdmin } from "@/components/nfc-attendance-admin";
 import { formatGymDate, gymDateKey } from "@/lib/gym-time";
 import { formatMoney } from "@/lib/currency";
 import { useGymCurrency } from "@/lib/currency-context";
@@ -24,7 +26,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 const nav = [
   ["Overview", LayoutDashboard], ["Members", Users], ["Inactive", UserX], ["Memberships", WalletCards],
   ["Classes", CalendarDays], ["Attendance", Fingerprint],
-  ["Payments", CreditCard], ["Reports", TrendingUp], ["Settings", Settings],
+  ["Payments", CreditCard], ["Data archive", Archive], ["Reports", TrendingUp], ["Settings", Settings],
 ] as const;
 export function Dashboard({ name = "Admin" }: { name?: string }) {
   const [active, setActive] = useState("Overview");
@@ -76,7 +78,7 @@ export function Dashboard({ name = "Admin" }: { name?: string }) {
       <div className="mx-auto max-w-[1500px] p-4 md:p-8">
         <section className="mb-7 flex flex-col justify-between gap-4 md:flex-row md:items-end"><div><p className="mb-2 text-xs font-bold uppercase text-primary">{formatGymDate(clock, timeZone)}</p><h1 className="font-display text-3xl font-bold uppercase md:text-4xl">{active}</h1><p className="mt-2 text-sm text-muted-foreground">Here’s what’s happening at {gymName} today.</p></div><div className="flex gap-2"><Button variant="outline" onClick={() => setActive("Classes")}><CalendarDays size={17}/> Schedule</Button><Button variant="secondary"><Activity size={17}/> Live floor</Button></div></section>
 
-        {active === "Settings" ? <SettingsAdmin/> : active === "Classes" ? <ClassesAdmin timeZone={timeZone} todayKey={todayKey} currency={currency}/> : active === "Memberships" ? <PlansAdmin/> : active === "Members" ? <MembersAdmin/> : active === "Payments" ? <PaymentsAdmin/> : active === "Inactive" ? <InactiveMembers/> : active !== "Overview" ? <ModuleView title={active}/> : <>
+        {active === "Settings" ? <SettingsAdmin/> : active === "Data archive" ? <DataArchiveAdmin timeZone={timeZone}/> : active === "Attendance" ? <NfcAttendanceAdmin/> : active === "Classes" ? <ClassesAdmin timeZone={timeZone} todayKey={todayKey} currency={currency}/> : active === "Memberships" ? <PlansAdmin/> : active === "Members" ? <MembersAdmin/> : active === "Payments" ? <PaymentsAdmin/> : active === "Inactive" ? <InactiveMembers/> : active !== "Overview" ? <ModuleView title={active}/> : <>
           <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <Metric icon={CircleDollarSign} label={`Revenue · ${monthLabel}`} value={data ? formatMoney(data.monthlyRevenue, currency) : "—"} note={revenueChange} tone="positive"/>
             <Metric icon={Users} label="Active members" value={data ? String(data.activeMembers) : "—"} note="With a current membership" tone="neutral"/>

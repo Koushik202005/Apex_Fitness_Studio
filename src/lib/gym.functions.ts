@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { fromMinorUnits, toMinorUnits } from "@/lib/currency";
-import { gymDateKey, shiftDateKey } from "@/lib/gym-time";
+import { gymDateKey, gymDateStartUtc, shiftDateKey } from "@/lib/gym-time";
 
 async function admin() {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -288,6 +288,155 @@ async function requireAdmin(context: { supabase: import("@supabase/supabase-js")
     .maybeSingle();
   if (error || !roleRow) throw new Error("Only administrators can perform this action.");
 }
+
+const nfcCredentialSchema = z.object({
+  memberId: z.string().uuid(),
+  token: z.string().regex(/^[A-Za-z0-9_-]{43}$/, "Invalid NFC card token."),
+  label: z.string().trim().max(80).optional().default("NFC card"),
+});
+
+const nfcTokenSchema = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/, "Invalid NFC card token.") });
+
+async function hashNfcToken(token: string) {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `nfc-sha256:${hex}`;
+}
+
+export const registerNfcMemberCard = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof nfcCredentialSchema>) => nfcCredentialSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const { data: member, error: memberError } = await db.from("members").select("id, status").eq("id", data.memberId).single();
+    if (memberError || !member) throw new Error("Member not found.");
+    if (member.status !== "active") throw new Error("Only active members can be issued an NFC check-in card.");
+    const { data: credential, error } = await db.from("access_credentials").insert({
+      member_id: member.id,
+      credential_type: "nfc",
+      external_reference: await hashNfcToken(data.token),
+      label: data.label || "NFC card",
+      active: true,
+    }).select("id").single();
+    if (error || !credential) throw new Error(error?.code === "23505" ? "This NFC card is already registered." : error?.message ?? "Could not register the NFC card.");
+    return { credentialId: credential.id };
+  });
+
+export const revokeNfcMemberCard = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { credentialId: string }) => z.object({ credentialId: z.string().uuid() }).parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const { data: credential, error } = await db.from("access_credentials").update({ active: false, revoked_at: new Date().toISOString() })
+      .eq("id", data.credentialId).eq("credential_type", "nfc").eq("active", true).select("id").maybeSingle();
+    if (error || !credential) throw new Error(error?.message ?? "Active NFC card not found.");
+    return { revoked: true };
+  });
+
+export const checkInWithNfcCard = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof nfcTokenSchema>) => nfcTokenSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const occurredAt = new Date();
+    const externalEventId = globalThis.crypto.randomUUID();
+    const { data: credential } = await db.from("access_credentials").select("id, member_id")
+      .eq("credential_type", "nfc").eq("external_reference", await hashNfcToken(data.token)).eq("active", true).maybeSingle();
+
+    let decision: "granted" | "denied" = "denied";
+    let reason: string | null = "Unknown or revoked NFC card.";
+    let memberCode: string | null = null;
+    let memberName: string | null = null;
+    let attendanceRecorded = false;
+    let alreadyCheckedIn = false;
+
+    if (credential) {
+      const [{ data: member }, { data: gym }] = await Promise.all([
+        db.from("members").select("id, member_code, status, profiles(display_name)").eq("id", credential.member_id).maybeSingle(),
+        db.from("gym_settings").select("timezone").order("updated_at", { ascending: false }).limit(1).maybeSingle(),
+      ]);
+      memberCode = member?.member_code ?? null;
+      memberName = member?.profiles?.display_name ?? null;
+      const timeZone = gym?.timezone ?? "Asia/Kolkata";
+      const today = gymDateKey(occurredAt, timeZone);
+      if (!member || member.status !== "active") {
+        reason = "Member is not active.";
+      } else {
+        const { data: memberships } = await db.from("memberships").select("id").eq("member_id", member.id)
+          .eq("status", "active").lte("starts_on", today).gte("ends_on", today).limit(1);
+        if (!memberships?.length) {
+          reason = "Member has no active membership today.";
+        } else {
+          const dayStart = gymDateStartUtc(today, timeZone).toISOString();
+          const tomorrowStart = gymDateStartUtc(shiftDateKey(today, 1), timeZone).toISOString();
+          const { data: existing } = await db.from("attendance").select("id").eq("member_id", member.id)
+            .gte("checked_in_at", dayStart).lt("checked_in_at", tomorrowStart).limit(1).maybeSingle();
+          if (existing) {
+            decision = "granted";
+            reason = "Already checked in today.";
+            alreadyCheckedIn = true;
+          } else {
+            const { error: attendanceError } = await db.from("attendance").insert({
+              member_id: member.id,
+              checked_in_at: occurredAt.toISOString(),
+              source: "nfc",
+              recorded_by: context.userId,
+              external_event_id: externalEventId,
+            });
+            if (attendanceError) reason = `Attendance could not be recorded: ${attendanceError.message}`;
+            else {
+              decision = "granted";
+              reason = "NFC check-in recorded.";
+              attendanceRecorded = true;
+            }
+          }
+        }
+      }
+    }
+
+    const { error: eventError } = await db.from("access_events").insert({
+      credential_id: credential?.id ?? null,
+      member_id: credential?.member_id ?? null,
+      external_event_id: externalEventId,
+      decision,
+      reason,
+      occurred_at: occurredAt.toISOString(),
+    });
+    if (eventError) throw new Error(`Could not save access event: ${eventError.message}`);
+    return { decision, reason, memberCode, memberName, attendanceRecorded, alreadyCheckedIn };
+  });
+
+const archivedGymDataSchema = z.object({
+  dataset: z.enum(["payments", "attendance", "classes"]),
+  before: z.string().datetime(),
+  exportedAt: z.string().datetime(),
+});
+
+export const deleteArchivedGymData = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof archivedGymDataSchema>) => archivedGymDataSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const { data: result, error } = await db.rpc("delete_archived_gym_data", {
+      p_dataset: data.dataset,
+      p_before: data.before,
+      p_exported_at: data.exportedAt,
+    });
+    if (error) throw new Error(`Could not delete archived data: ${error.message}`);
+    if (!result || typeof result !== "object" || Array.isArray(result) || !("deleted" in result)) {
+      throw new Error("The database returned an unexpected archive cleanup result.");
+    }
+    const deletedValue = (result as { deleted: unknown }).deleted;
+    if (!deletedValue || typeof deletedValue !== "object" || Array.isArray(deletedValue)) {
+      throw new Error("The database returned invalid archive cleanup counts.");
+    }
+    const deleted = Object.fromEntries(Object.entries(deletedValue).map(([key, value]) => [key, Number(value)]));
+    return { deleted };
+  });
 
 /* ---------------- Admin: Gmail OAuth for renewal email ---------------- */
 

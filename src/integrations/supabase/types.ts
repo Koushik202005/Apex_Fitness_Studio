@@ -1278,6 +1278,10 @@ export type Database = {
         }
         Returns: { completed: boolean; new_membership_id: string }[]
       }
+      delete_archived_gym_data: {
+        Args: { p_dataset: string; p_before: string; p_exported_at: string }
+        Returns: Json
+      }
       [_ in never]: never
     }
     Enums: {
