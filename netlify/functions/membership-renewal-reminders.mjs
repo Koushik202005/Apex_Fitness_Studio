@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { getGmailAccessToken, sendRenewalEmail } from "../../src/lib/renewal-email.server.ts";
+import { loadGmailOAuthCredentials } from "../../src/lib/gmail-oauth.server.ts";
 
 const FIRST_REMINDER_WINDOW = { daysBefore: 7, minDaysLeft: 5 };
 const FOLLOW_UP_WINDOW = { daysBefore: 4, minDaysLeft: 1 };
@@ -91,7 +92,7 @@ async function claimReminder(supabase, membershipId, daysBefore, email, existing
 
 export default async function membershipRenewalReminders() {
   const supabase = createAdminClient();
-  requiredEnv("GMAIL_SENDER_EMAIL");
+  const gmailCredentials = await loadGmailOAuthCredentials(supabase);
   const { data: gym, error: gymError } = await supabase
     .from("gym_settings")
     .select("gym_name, timezone")
@@ -180,10 +181,11 @@ export default async function membershipRenewalReminders() {
     const reminder = { ...claimed, days_before: dueWindow.daysBefore };
 
     try {
-      accessTokenPromise ??= getGmailAccessToken();
+      accessTokenPromise ??= getGmailAccessToken(gmailCredentials);
       const accessToken = await accessTokenPromise;
       const providerMessageId = await sendRenewalEmail({
         accessToken,
+        senderEmail: gmailCredentials.senderEmail,
         email: profile.email,
         appUrl,
         gymName,
