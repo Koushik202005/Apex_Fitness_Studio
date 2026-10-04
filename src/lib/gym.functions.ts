@@ -440,6 +440,107 @@ export const deleteArchivedGymData = createServerFn({ method: "POST" })
 
 /* ---------------- Admin: Gmail OAuth for renewal email ---------------- */
 
+/* ---------------- Admin: Google Drive daily archives ---------------- */
+
+const driveArchiveSetupSchema = z.object({
+  clientId: z.string().trim().min(10).max(300),
+  clientSecret: z.string().trim().max(500).optional().default(""),
+});
+
+export const getDriveArchiveSettings = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const [{ supabaseAdmin }, { getRequest }, oauth] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@tanstack/react-start/server"),
+      import("@/lib/drive-archive-oauth.server"),
+    ]);
+    const row = await oauth.readDriveArchiveOAuthRow(supabaseAdmin);
+    const request = getRequest();
+    const { data: runs, error } = await (supabaseAdmin as any).from("gym_data_archive_runs")
+      .select("archive_date, dataset, drive_file_name, row_count, exported_at, drive_file_id")
+      .order("exported_at", { ascending: false }).limit(10);
+    if (error) throw new Error(`Could not load archive run history: ${error.message}`);
+    return {
+      clientId: row?.client_id || "",
+      senderEmail: row?.sender_email || null,
+      connectedAt: row?.connected_at || null,
+      folderUrl: row?.folder_url || null,
+      callbackUrl: request ? oauth.driveArchiveCallbackUrl(request.url) : "",
+      configured: Boolean(row?.refresh_token_ciphertext && row.sender_email && row.folder_id),
+      recentRuns: (runs || []).map((run: { archive_date: string; dataset: string; drive_file_name: string; row_count: number; exported_at: string; drive_file_id: string }) => ({
+        ...run,
+        url: `https://drive.google.com/file/d/${run.drive_file_id}/view`,
+      })),
+    };
+  });
+
+export const beginDriveArchiveOAuth = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof driveArchiveSetupSchema>) => driveArchiveSetupSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const request = (await import("@tanstack/react-start/server")).getRequest();
+    if (!request) throw new Error("Could not read the current request. Reload Settings and try again.");
+    const [{ supabaseAdmin }, oauth] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@/lib/drive-archive-oauth.server"),
+    ]);
+    const previous = await oauth.readDriveArchiveOAuthRow(supabaseAdmin);
+    const clientId = data.clientId.trim();
+    if (!clientId.endsWith(".apps.googleusercontent.com")) throw new Error("Enter a Google OAuth Web client ID ending in .apps.googleusercontent.com.");
+    const submittedSecret = data.clientSecret.trim();
+    if (previous && previous.client_id !== clientId && !submittedSecret) throw new Error("Enter the client secret that belongs to the new client ID.");
+    const priorSecret = !submittedSecret && previous?.client_secret_ciphertext ? oauth.decryptDriveSecret(previous.client_secret_ciphertext) : "";
+    const clientSecret = submittedSecret || priorSecret;
+    if (!clientSecret) throw new Error("Enter your Google OAuth client secret.");
+    const changed = Boolean(previous && (previous.client_id !== clientId || submittedSecret));
+    const { error } = await (supabaseAdmin as any).from("gym_drive_archive_oauth").upsert({
+      id: 1,
+      client_id: clientId,
+      client_secret_ciphertext: oauth.encryptDriveSecret(clientSecret),
+      refresh_token_ciphertext: changed ? null : previous?.refresh_token_ciphertext ?? null,
+      sender_email: changed ? null : previous?.sender_email ?? null,
+      folder_id: changed ? null : previous?.folder_id ?? null,
+      folder_url: changed ? null : previous?.folder_url ?? null,
+      connected_at: changed ? null : previous?.connected_at ?? null,
+      updated_by: context.userId,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "id" });
+    if (error) throw new Error(`Could not save Google Drive OAuth settings: ${error.message}`);
+    const redirectUri = oauth.driveArchiveCallbackUrl(request.url);
+    const state = oauth.sealDriveOAuthState({ adminId: context.userId, issuedAt: Math.floor(Date.now() / 1000), nonce: oauth.createDriveOAuthNonce(), redirectUri });
+    const authorizationUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+    authorizationUrl.search = new URLSearchParams({
+      client_id: clientId, redirect_uri: redirectUri, response_type: "code",
+      scope: `openid email ${oauth.DRIVE_FILE_SCOPE}`, access_type: "offline",
+      include_granted_scopes: "true", prompt: "consent", state,
+    }).toString();
+    return { authorizationUrl: authorizationUrl.toString() };
+  });
+
+export const disconnectDriveArchive = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { error } = await (supabaseAdmin as any).from("gym_drive_archive_oauth").delete().eq("id", 1);
+    if (error) throw new Error(`Could not disconnect Google Drive: ${error.message}`);
+    return { disconnected: true };
+  });
+
+export const runDriveArchiveNow = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const [{ supabaseAdmin }, archive] = await Promise.all([
+      import("@/integrations/supabase/client.server"),
+      import("@/lib/drive-archive.server"),
+    ]);
+    return archive.runDailyGymDataArchive(supabaseAdmin);
+  });
+
 const gmailOAuthSetupSchema = z.object({
   clientId: z.string().trim().min(10).max(300),
   clientSecret: z.string().trim().max(500).optional().default(""),
