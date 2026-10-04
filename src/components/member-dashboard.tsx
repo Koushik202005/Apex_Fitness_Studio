@@ -2,11 +2,11 @@ import { useEffect, useState } from "react";
 import { Link, useRouter } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { Bell, CalendarClock, CheckCircle2, Loader2, LogOut, Receipt, RefreshCw, Tag } from "lucide-react";
+import { Bell, CalendarClock, CalendarDays, CheckCircle2, Clock3, Loader2, LogOut, Receipt, RefreshCw, Tag, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import type { Tables } from "@/integrations/supabase/types";
-import { createRazorpayOrder, createStripeCheckout, getGymBranding, quotePlan, verifyRazorpayPayment, verifyStripeCheckout } from "@/lib/gym.functions";
+import { createRazorpayOrder, createStripeCheckout, enrollMemberInClass, getGymBranding, getMemberClassSchedule, quotePlan, verifyRazorpayPayment, verifyStripeCheckout } from "@/lib/gym.functions";
 import { signOut } from "@/lib/sign-out";
 import { formatMoney } from "@/lib/currency";
 import { useGymCurrency } from "@/lib/currency-context";
@@ -92,6 +92,8 @@ export function MemberDashboard({ profile }: { profile: Tables<"profiles"> }) {
         <div className="panel p-5"><h2 className="section-title flex items-center gap-2"><Bell size={17}/> Updates</h2><div className="mt-3 space-y-3">{data?.notes.length ? data.notes.map(n=><div key={n.id} className="border-l-2 border-primary pl-3"><p className="text-sm font-semibold">{n.title}</p><p className="text-xs text-muted-foreground">{n.message}</p></div>) : <p className="text-sm text-muted-foreground">No updates yet.</p>}</div></div>
       </section>
 
+      <MemberClassSchedule />
+
       <section id="plans"><h2 className="section-title">{current ? "Renew or change plan" : "Choose your plan"}</h2>
         {stripeMessage && <p role="status" className="mt-3 text-sm text-muted-foreground">{stripeMessage}</p>}
         <div className="mt-4 grid gap-4 md:grid-cols-3">{data?.plans.map(p=><PlanCard key={p.id} plan={p} gymName={gymName} currency={currency} paymentGateway={gymSettings.data?.payment_gateway ?? "razorpay"} onPaid={()=>qc.invalidateQueries({queryKey:["member-home"]})}/>)}</div>
@@ -103,6 +105,69 @@ export function MemberDashboard({ profile }: { profile: Tables<"profiles"> }) {
       </section>
     </main>
   </div>;
+}
+
+function MemberClassSchedule() {
+  const queryClient = useQueryClient();
+  const loadSchedule = useServerFn(getMemberClassSchedule);
+  const enroll = useServerFn(enrollMemberInClass);
+  const schedule = useQuery({
+    queryKey: ["member-class-schedule"],
+    queryFn: () => loadSchedule(),
+    refetchInterval: 30_000,
+  });
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  async function book(scheduleId: string) {
+    setBusyId(scheduleId); setError(""); setMessage("");
+    try {
+      const result = await enroll({ data: { scheduleId } });
+      if (result.status === "booked" || result.status === "already_booked") setMessage("You’re enrolled in this class.");
+      else setMessage(`This class is full. You’re on the waitlist${result.waitlistPosition ? ` at position ${result.waitlistPosition}` : ""}.`);
+      await queryClient.invalidateQueries({ queryKey: ["member-class-schedule"] });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not enroll in this class.");
+      await queryClient.invalidateQueries({ queryKey: ["member-class-schedule"] });
+    } finally { setBusyId(""); }
+  }
+
+  const classes = schedule.data?.classes ?? [];
+  return <section className="panel overflow-hidden">
+    <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border p-5 md:p-6">
+      <div><h2 className="section-title flex items-center gap-2"><CalendarDays size={19}/> Upcoming classes</h2><p className="section-subtitle">Enroll in a scheduled session before it starts.</p></div>
+      {schedule.isFetching && <Loader2 className="mt-1 animate-spin text-muted-foreground" size={17} aria-label="Refreshing classes"/>}
+    </div>
+    {error && <p role="alert" className="mx-5 mt-4 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
+    {message && <p role="status" className="mx-5 mt-4 rounded-md bg-success-soft px-3 py-2 text-sm text-success">{message}</p>}
+    {!schedule.data && schedule.isLoading ? <div className="flex items-center gap-2 p-8 text-sm text-muted-foreground"><Loader2 className="animate-spin" size={17}/>Loading upcoming classes…</div>
+      : schedule.isError ? <p role="alert" className="p-5 text-sm text-destructive">{schedule.error instanceof Error ? schedule.error.message : "Could not load upcoming classes."}</p>
+      : classes.length === 0 ? <p className="p-6 text-sm text-muted-foreground">There are no upcoming classes open for enrollment right now.</p>
+      : <div className="grid gap-3 p-4 md:grid-cols-2">{classes.map((session) => {
+        const alreadyBooked = Boolean(session.bookingStatus && session.bookingStatus !== "cancelled");
+        const waitlisted = session.waitlistPosition != null;
+        const full = session.booked >= session.capacity;
+        const canEnroll = Boolean(schedule.data?.hasActiveMembership);
+        const starts = new Date(session.startsAt);
+        return <article key={session.id} className="rounded-md border border-border bg-card/60 p-4">
+          <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h3 className="truncate font-display text-lg font-bold uppercase">{session.className}</h3><p className="mt-1 text-xs text-muted-foreground">{session.category}{session.category && session.coach ? " · " : ""}{session.coach}</p></div>
+            {alreadyBooked ? <span className="shrink-0 rounded-full bg-success-soft px-2.5 py-1 text-xs font-semibold text-success">Enrolled</span> : waitlisted ? <span className="shrink-0 rounded-full bg-warning-soft px-2.5 py-1 text-xs font-semibold text-warning">Waitlist #{session.waitlistPosition}</span> : null}
+          </div>
+          {session.description && <p className="mt-3 line-clamp-2 text-sm text-muted-foreground">{session.description}</p>}
+          <div className="mt-4 flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1.5"><CalendarDays size={14}/>{new Intl.DateTimeFormat("en-IN", { timeZone: schedule.data?.timeZone, weekday: "short", day: "numeric", month: "short", year: "numeric" }).format(starts)}</span>
+            <span className="inline-flex items-center gap-1.5"><Clock3 size={14}/>{new Intl.DateTimeFormat("en-IN", { timeZone: schedule.data?.timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(starts)} · {session.durationMinutes} min</span>
+            <span className="inline-flex items-center gap-1.5"><Users size={14}/>{session.booked}/{session.capacity} booked</span>
+          </div>
+          {!canEnroll && <p className="mt-3 text-xs text-warning">An active membership is required to enroll.</p>}
+          <Button className="mt-4 w-full" variant={alreadyBooked ? "secondary" : "default"} disabled={!canEnroll || alreadyBooked || busyId !== ""} onClick={() => void book(session.id)}>
+            {busyId === session.id ? <Loader2 className="animate-spin" size={15}/> : alreadyBooked ? <CheckCircle2 size={15}/> : <CalendarDays size={15}/>}
+            {busyId === session.id ? "Enrolling…" : alreadyBooked ? "Enrolled" : waitlisted ? `Join waitlist · #${session.waitlistPosition}` : full ? "Join waitlist" : "Enroll in class"}
+          </Button>
+        </article>;
+      })}</div>}
+  </section>;
 }
 
 function PlanCard({ plan, gymName, currency, paymentGateway, onPaid }: { plan: Tables<"membership_plans">; gymName: string; currency: string; paymentGateway: string; onPaid: () => void }) {

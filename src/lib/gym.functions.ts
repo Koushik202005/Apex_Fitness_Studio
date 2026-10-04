@@ -87,6 +87,110 @@ export const quotePlan = createServerFn({ method: "POST" })
   .inputValidator((d: { planId: string; coupon?: string }) => z.object({ planId: z.string().uuid(), coupon: z.string().max(40).optional() }).parse(d))
   .handler(async ({ data, context }) => buildQuote(await admin(), context.userId, data.planId, data.coupon));
 
+/* ---------------- Member: upcoming classes and enrollment ---------------- */
+
+export const getMemberClassSchedule = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const db = await admin();
+    const [{ data: member, error: memberError }, { data: gym, error: gymError }] = await Promise.all([
+      db.from("members").select("id, member_code, status").eq("profile_id", context.userId).maybeSingle(),
+      db.from("gym_settings").select("timezone, booking_window_days").order("updated_at", { ascending: false }).limit(1).maybeSingle(),
+    ]);
+    if (memberError) throw new Error(`Could not load your member record: ${memberError.message}`);
+    if (gymError) throw new Error(`Could not load gym scheduling settings: ${gymError.message}`);
+    if (!member || member.status !== "active") return { memberId: null, hasActiveMembership: false, timeZone: gym?.timezone || "Asia/Kolkata", classes: [] };
+
+    const timeZone = gym?.timezone || "Asia/Kolkata";
+    const today = gymDateKey(new Date(), timeZone);
+    const now = new Date();
+    const windowEnd = new Date(now.getTime() + Math.max(1, Number(gym?.booking_window_days || 14)) * 86_400_000);
+    const [{ data: memberships, error: membershipError }, { data: schedules, error: scheduleError }] = await Promise.all([
+      db.from("memberships").select("id, starts_on, ends_on").eq("member_id", member.id).eq("status", "active").lte("starts_on", today).gte("ends_on", today),
+      db.from("class_schedules").select("id, class_id, trainer_id, starts_at, ends_at, capacity")
+        .eq("status", "scheduled").gt("starts_at", now.toISOString()).lte("starts_at", windowEnd.toISOString()).order("starts_at").limit(100),
+    ]);
+    if (membershipError) throw new Error(`Could not check your membership: ${membershipError.message}`);
+    if (scheduleError) throw new Error(`Could not load upcoming classes: ${scheduleError.message}`);
+    const upcoming = schedules ?? [];
+    const scheduleIds = upcoming.map((schedule) => schedule.id);
+    const classIds = [...new Set(upcoming.map((schedule) => schedule.class_id))];
+    const trainerIds = [...new Set(upcoming.flatMap((schedule) => schedule.trainer_id ? [schedule.trainer_id] : []))];
+    const [{ data: classRows, error: classesError }, { data: trainerRows, error: trainersError }] = await Promise.all([
+      classIds.length ? db.from("classes").select("id, name, category, description, duration_minutes, active").in("id", classIds) : Promise.resolve({ data: [], error: null }),
+      trainerIds.length ? db.from("trainers").select("id, profile_id").in("id", trainerIds) : Promise.resolve({ data: [], error: null }),
+    ]);
+    if (classesError) throw new Error(`Could not load class details: ${classesError.message}`);
+    if (trainersError) throw new Error(`Could not load trainer details: ${trainersError.message}`);
+    const profileIds = [...new Set((trainerRows ?? []).map((trainer) => trainer.profile_id))];
+    const { data: trainerProfiles, error: trainerProfilesError } = profileIds.length
+      ? await db.from("profiles").select("id, display_name").in("id", profileIds)
+      : { data: [], error: null };
+    if (trainerProfilesError) throw new Error(`Could not load trainer names: ${trainerProfilesError.message}`);
+
+    const activeClasses = (classRows ?? []).filter((gymClass) => gymClass.active);
+    const activeClassIds = new Set(activeClasses.map((gymClass) => gymClass.id));
+    const visibleSchedules = upcoming.filter((schedule) => activeClassIds.has(schedule.class_id));
+    const visibleScheduleIds = visibleSchedules.map((schedule) => schedule.id);
+    const [{ data: allBookings, error: bookingsError }, { data: myBookings, error: myBookingsError }, { data: myWaitlist, error: waitlistError }] = await Promise.all([
+      visibleScheduleIds.length ? db.from("class_bookings").select("schedule_id").in("schedule_id", visibleScheduleIds).eq("status", "booked") : Promise.resolve({ data: [], error: null }),
+      visibleScheduleIds.length ? db.from("class_bookings").select("schedule_id, status").eq("member_id", member.id).in("schedule_id", visibleScheduleIds) : Promise.resolve({ data: [], error: null }),
+      visibleScheduleIds.length ? db.from("class_waitlists").select("schedule_id, position").eq("member_id", member.id).in("schedule_id", visibleScheduleIds) : Promise.resolve({ data: [], error: null }),
+    ]);
+    if (bookingsError) throw new Error(`Could not load class availability: ${bookingsError.message}`);
+    if (myBookingsError) throw new Error(`Could not load your class bookings: ${myBookingsError.message}`);
+    if (waitlistError) throw new Error(`Could not load your waitlist entries: ${waitlistError.message}`);
+
+    const classById = new Map((activeClasses).map((gymClass) => [gymClass.id, gymClass]));
+    const trainerById = new Map((trainerRows ?? []).map((trainer) => [trainer.id, trainer.profile_id]));
+    const profileById = new Map((trainerProfiles ?? []).map((profile) => [profile.id, profile.display_name]));
+    const bookedCount = new Map<string, number>();
+    for (const booking of allBookings ?? []) bookedCount.set(booking.schedule_id, (bookedCount.get(booking.schedule_id) ?? 0) + 1);
+    const bookingBySchedule = new Map((myBookings ?? []).map((booking) => [booking.schedule_id, booking.status]));
+    const waitlistBySchedule = new Map((myWaitlist ?? []).map((entry) => [entry.schedule_id, entry.position]));
+    return {
+      memberId: member.id,
+      hasActiveMembership: Boolean(memberships?.length),
+      timeZone,
+      classes: visibleSchedules.map((schedule) => {
+        const gymClass = classById.get(schedule.class_id);
+        const trainerProfile = schedule.trainer_id ? trainerById.get(schedule.trainer_id) : null;
+        return {
+          id: schedule.id,
+          className: gymClass?.name || "Class",
+          category: gymClass?.category || "",
+          description: gymClass?.description || "",
+          durationMinutes: gymClass?.duration_minutes || Math.max(1, Math.round((new Date(schedule.ends_at).getTime() - new Date(schedule.starts_at).getTime()) / 60_000)),
+          coach: trainerProfile ? profileById.get(trainerProfile) || "Coach" : "Coach to be assigned",
+          startsAt: schedule.starts_at,
+          endsAt: schedule.ends_at,
+          capacity: schedule.capacity,
+          booked: bookedCount.get(schedule.id) ?? 0,
+          bookingStatus: bookingBySchedule.get(schedule.id) || null,
+          waitlistPosition: waitlistBySchedule.get(schedule.id) ?? null,
+        };
+      }),
+    };
+  });
+
+export const enrollMemberInClass = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { scheduleId: string }) => z.object({ scheduleId: z.string().uuid() }).parse(data))
+  .handler(async ({ data, context }) => {
+    const db = await admin();
+    const { data: member, error: memberError } = await db.from("members").select("id, status").eq("profile_id", context.userId).maybeSingle();
+    if (memberError || !member || member.status !== "active") throw new Error("An active member profile is required to enroll in a class.");
+    const { data: result, error } = await (db as any).rpc("enroll_member_in_class", {
+      p_schedule_id: data.scheduleId,
+      p_member_id: member.id,
+      p_user_id: context.userId,
+    });
+    if (error) throw new Error(error.message || "Could not enroll in this class.");
+    const enrollment = Array.isArray(result) ? result[0] : result;
+    if (!enrollment?.outcome) throw new Error("The database returned an unexpected enrollment result.");
+    return { status: enrollment.outcome as "booked" | "waitlisted" | "already_booked", waitlistPosition: enrollment.waitlist_position == null ? null : Number(enrollment.waitlist_position) };
+  });
+
 /* ---------------- Razorpay ---------------- */
 
 export const createRazorpayOrder = createServerFn({ method: "POST" })
