@@ -967,7 +967,10 @@ export const disconnectPaymentGateway = createServerFn({ method: "POST" })
     return { disconnected: true };
   });
 
-const expiringMembershipSchema = z.object({ membershipId: z.string().uuid() });
+const expiringMembershipSchema = z.object({
+  membershipId: z.string().uuid(),
+  reminderType: z.enum(["expiring", "expired"]).default("expiring"),
+});
 
 export const getExpiringMembers = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -1041,9 +1044,83 @@ export const getExpiringMembers = createServerFn({ method: "GET" })
     };
   });
 
+export const getExpiredMembers = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const { data: gym, error: gymError } = await db.from("gym_settings")
+      .select("timezone")
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (gymError) throw new Error(gymError.message);
+    const timeZone = gym?.timezone || "Asia/Kolkata";
+    const today = gymDateKey(new Date(), timeZone);
+    const { data: expiredMemberships, error: membershipsError } = await db.from("memberships")
+      .select("id, member_id, starts_on, ends_on")
+      .in("status", ["active", "expired"])
+      .lte("starts_on", today)
+      .lt("ends_on", today)
+      .order("ends_on", { ascending: false });
+    if (membershipsError) throw new Error(membershipsError.message);
+    if (!expiredMemberships?.length) return { today, timeZone, members: [] };
+
+    const latestExpiredByMember = new Map<string, NonNullable<typeof expiredMemberships>[number]>();
+    for (const membership of expiredMemberships) {
+      if (!latestExpiredByMember.has(membership.member_id)) latestExpiredByMember.set(membership.member_id, membership);
+    }
+    const candidateMemberIds = [...latestExpiredByMember.keys()];
+    const [{ data: currentOrUpcoming, error: currentError }, { data: members, error: membersError }, { data: roles, error: rolesError }] = await Promise.all([
+      db.from("memberships").select("member_id").in("member_id", candidateMemberIds).in("status", ["active", "pending"]).gte("ends_on", today),
+      db.from("members").select("id, member_code, profile_id").in("id", candidateMemberIds),
+      db.from("user_roles").select("user_id").eq("role", "admin"),
+    ]);
+    if (currentError) throw new Error(currentError.message);
+    if (membersError) throw new Error(membersError.message);
+    if (rolesError) throw new Error(rolesError.message);
+    const blockedMemberIds = new Set((currentOrUpcoming ?? []).map((membership) => membership.member_id));
+    const admins = new Set((roles ?? []).map((role) => role.user_id));
+    const eligibleMembers = (members ?? []).filter((member) => !blockedMemberIds.has(member.id) && !admins.has(member.profile_id));
+    if (!eligibleMembers.length) return { today, timeZone, members: [] };
+
+    const eligibleIds = eligibleMembers.map((member) => member.id);
+    const profileIds = [...new Set(eligibleMembers.map((member) => member.profile_id))];
+    const membershipIds = eligibleIds.map((memberId) => latestExpiredByMember.get(memberId)!.id);
+    const [{ data: profiles, error: profilesError }, { data: reminders, error: remindersError }] = await Promise.all([
+      db.from("profiles").select("id, display_name, email, phone").in("id", profileIds),
+      db.from("renewal_reminders").select("membership_id, delivery_status, sent_at").in("membership_id", membershipIds).eq("days_before", -1),
+    ]);
+    if (profilesError) throw new Error(profilesError.message);
+    if (remindersError) throw new Error(remindersError.message);
+
+    const profileById = new Map((profiles ?? []).map((profile) => [profile.id, profile]));
+    const reminderByMembership = new Map((reminders ?? []).map((reminder) => [reminder.membership_id, reminder]));
+    return {
+      today,
+      timeZone,
+      members: eligibleMembers.flatMap((member) => {
+        const profile = profileById.get(member.profile_id);
+        const membership = latestExpiredByMember.get(member.id);
+        if (!profile || !membership) return [];
+        return [{
+          id: member.id,
+          memberCode: member.member_code,
+          profileId: member.profile_id,
+          name: profile.display_name || profile.email || member.member_code,
+          email: profile.email,
+          phone: profile.phone,
+          membershipId: membership.id,
+          endsOn: membership.ends_on,
+          manualReminder: reminderByMembership.get(membership.id) ?? null,
+        }];
+      }),
+    };
+  });
+
 export const sendExpiringMemberReminder = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((data: { membershipId: string }) => expiringMembershipSchema.parse(data))
+  .inputValidator((data: { membershipId: string; reminderType?: "expiring" | "expired" }) => expiringMembershipSchema.parse(data))
   .handler(async ({ data, context }) => {
     await requireAdmin(context);
     const db = await admin();
@@ -1056,17 +1133,30 @@ export const sendExpiringMemberReminder = createServerFn({ method: "POST" })
     if (!gym) throw new Error("Gym settings have not been initialized.");
     const timeZone = gym.timezone || "Asia/Kolkata";
     const today = gymDateKey(new Date(), timeZone);
-    const throughDate = shiftDateKey(today, 7);
     const { data: membership, error: membershipError } = await db.from("memberships")
-      .select("id, member_id, starts_on, ends_on")
+      .select("id, member_id, starts_on, ends_on, status")
       .eq("id", data.membershipId)
-      .eq("status", "active")
-      .lte("starts_on", today)
-      .gte("ends_on", today)
-      .lte("ends_on", throughDate)
       .maybeSingle();
     if (membershipError) throw new Error(membershipError.message);
-    if (!membership) throw new Error("This membership is no longer active or does not expire within the next seven days.");
+    if (!membership) throw new Error("Membership record not found.");
+    if (data.reminderType === "expired") {
+      if (!["active", "expired"].includes(membership.status) || membership.starts_on > today || membership.ends_on >= today) {
+        throw new Error("This membership has not expired or is no longer eligible for an expired-membership reminder.");
+      }
+      const { data: newerMemberships, error: newerMembershipsError } = await db.from("memberships")
+        .select("id")
+        .eq("member_id", membership.member_id)
+        .in("status", ["active", "expired", "pending"])
+        .gt("ends_on", membership.ends_on)
+        .limit(1);
+      if (newerMembershipsError) throw new Error(newerMembershipsError.message);
+      if (newerMemberships?.length) throw new Error("A newer membership exists. Refresh the expired-membership list before sending a reminder.");
+    } else {
+      const throughDate = shiftDateKey(today, 7);
+      if (membership.status !== "active" || membership.starts_on > today || membership.ends_on < today || membership.ends_on > throughDate) {
+        throw new Error("This membership is no longer active or does not expire within the next seven days.");
+      }
+    }
 
     const { data: member, error: memberError } = await db.from("members").select("id, profile_id").eq("id", membership.member_id).maybeSingle();
     if (memberError) throw new Error(memberError.message);
@@ -1075,10 +1165,11 @@ export const sendExpiringMemberReminder = createServerFn({ method: "POST" })
     if (profileError) throw new Error(profileError.message);
     if (!profile?.email) throw new Error("This member does not have an email address on their profile.");
 
+    const reminderDaysBefore = data.reminderType === "expired" ? -1 : 0;
     const { data: existing, error: reminderError } = await db.from("renewal_reminders")
       .select("id, delivery_status, attempt_count, attempted_at, sent_at")
       .eq("membership_id", membership.id)
-      .eq("days_before", 0)
+      .eq("days_before", reminderDaysBefore)
       .maybeSingle();
     if (reminderError) throw new Error(reminderError.message);
     if (existing?.delivery_status === "sent") return { sent: true, alreadySent: true, sentAt: existing.sent_at };
@@ -1088,7 +1179,7 @@ export const sendExpiringMemberReminder = createServerFn({ method: "POST" })
     if (!existing) {
       const { data: claimed, error: claimError } = await db.from("renewal_reminders").insert({
         membership_id: membership.id,
-        days_before: 0,
+        days_before: reminderDaysBefore,
         channels: [],
         delivery_status: "sending",
         attempt_count: 1,
@@ -1133,7 +1224,8 @@ export const sendExpiringMemberReminder = createServerFn({ method: "POST" })
         expiresOn: membership.ends_on,
         timeZone,
         appUrl: process.env["APP_URL"] || process.env["URL"] || "",
-        reminderDaysBefore: 0,
+        reminderDaysBefore,
+        membershipExpired: data.reminderType === "expired",
         reminderId,
       });
       const sentAt = new Date().toISOString();

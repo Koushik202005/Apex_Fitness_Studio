@@ -43,6 +43,7 @@ export async function sendRenewalEmail({
   timeZone,
   appUrl,
   reminderDaysBefore,
+  membershipExpired = false,
   reminderId,
 }: {
   accessToken: string;
@@ -54,6 +55,7 @@ export async function sendRenewalEmail({
   timeZone: string;
   appUrl?: string;
   reminderDaysBefore: number;
+  membershipExpired?: boolean;
   reminderId: string;
 }) {
   if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(senderEmail)) {
@@ -68,12 +70,19 @@ export async function sendRenewalEmail({
     timeZone,
   }).format(new Date(`${expiresOn}T12:00:00.000Z`));
   const firstReminder = reminderDaysBefore === 7 || reminderDaysBefore === 0;
-  const reminderLabel = firstReminder ? "membership renewal reminder" : "membership renewal follow-up";
-  const subject = `${gymName}: your membership expires on ${expiryLabel}`;
+  const reminderLabel = membershipExpired ? "expired membership reminder" : firstReminder ? "membership renewal reminder" : "membership renewal follow-up";
+  const subject = membershipExpired ? `${gymName}: your membership expired on ${expiryLabel}` : `${gymName}: your membership expires on ${expiryLabel}`;
   const signInUrl = appUrl ? `${appUrl.replace(/\/$/, "")}/auth` : null;
   const greeting = memberName ? `Hello ${escapeHtml(memberName)},` : "Hello,";
-  const html = `<!doctype html><html><body style="margin:0;background:#f5f6f8;font-family:Arial,sans-serif;color:#17202a"><main style="max-width:600px;margin:32px auto;padding:28px;background:#fff;border-radius:12px"><p style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#687385">${escapeHtml(gymName)}</p><h1 style="font-size:24px">Membership renewal reminder</h1><p>${greeting}</p><p>This is your ${firstReminder ? "renewal" : "follow-up renewal"} reminder. Your current membership expires on <strong>${escapeHtml(expiryLabel)}</strong>.</p><p>Renew before it expires to keep your membership active.</p>${signInUrl ? `<p style="margin:28px 0"><a href="${escapeHtml(signInUrl)}" style="background:#176b48;color:#fff;text-decoration:none;padding:12px 18px;border-radius:6px">Sign in to view membership plans</a></p>` : ""}<p style="font-size:12px;color:#687385">This is an automated ${escapeHtml(reminderLabel)} from ${escapeHtml(gymName)}.</p></main></body></html>`;
-  const text = `${memberName ? `Hello ${memberName},\n\n` : "Hello,\n\n"}This is your ${firstReminder ? "renewal" : "follow-up renewal"} reminder. Your current membership expires on ${expiryLabel}. Renew before it expires to keep your membership active.${signInUrl ? `\n\nSign in to view membership plans: ${signInUrl}` : ""}`;
+  const title = membershipExpired ? "Your membership has expired" : "Membership renewal reminder";
+  const bodyCopy = membershipExpired
+    ? `Your membership expired on <strong>${escapeHtml(expiryLabel)}</strong>. Renew your membership to get back to training at ${escapeHtml(gymName)}.`
+    : `This is your ${firstReminder ? "renewal" : "follow-up renewal"} reminder. Your current membership expires on <strong>${escapeHtml(expiryLabel)}</strong>. Renew before it expires to keep your membership active.`;
+  const ctaLabel = membershipExpired ? "Sign in to renew your membership" : "Sign in to view membership plans";
+  const html = `<!doctype html><html><body style="margin:0;background:#f5f6f8;font-family:Arial,sans-serif;color:#17202a"><main style="max-width:600px;margin:32px auto;padding:28px;background:#fff;border-radius:12px"><p style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#687385">${escapeHtml(gymName)}</p><h1 style="font-size:24px">${title}</h1><p>${greeting}</p><p>${bodyCopy}</p>${signInUrl ? `<p style="margin:28px 0"><a href="${escapeHtml(signInUrl)}" style="background:#176b48;color:#fff;text-decoration:none;padding:12px 18px;border-radius:6px">${ctaLabel}</a></p>` : ""}<p style="font-size:12px;color:#687385">This is an ${escapeHtml(reminderLabel)} from ${escapeHtml(gymName)}.</p></main></body></html>`;
+  const text = membershipExpired
+    ? `${memberName ? `Hello ${memberName},\n\n` : "Hello,\n\n"}Your membership expired on ${expiryLabel}. Renew your membership to get back to training at ${gymName}.${signInUrl ? `\n\nSign in to renew your membership: ${signInUrl}` : ""}`
+    : `${memberName ? `Hello ${memberName},\n\n` : "Hello,\n\n"}This is your ${firstReminder ? "renewal" : "follow-up renewal"} reminder. Your current membership expires on ${expiryLabel}. Renew before it expires to keep your membership active.${signInUrl ? `\n\nSign in to view membership plans: ${signInUrl}` : ""}`;
   const boundary = `gym-renewal-${reminderId.replace(/[^a-zA-Z0-9-]/g, "")}`;
   const mimeMessage = [
     `From: ${encodeHeader(gymName)} <${senderEmail}>`,

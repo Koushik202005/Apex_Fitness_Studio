@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { Bell, CreditCard, Loader2, Trash2, UserPlus } from "lucide-react";
+import { Bell, CheckCircle2, CreditCard, Loader2, Mail, Trash2, UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { deleteMemberProfile } from "@/lib/gym.functions";
+import { deleteMemberProfile, getExpiredMembers, sendExpiringMemberReminder } from "@/lib/gym.functions";
 import { formatMoney } from "@/lib/currency";
 import { useGymCurrency } from "@/lib/currency-context";
 
@@ -89,23 +89,16 @@ export function NotificationsBell() {
   </div>;
 }
 
-export function InactiveMembers() {
+export function InactiveMembers({ timeZone }: { timeZone: string }) {
   const qc = useQueryClient();
   const del = useServerFn(deleteMemberProfile);
+  const loadExpired = useServerFn(getExpiredMembers);
+  const sendReminder = useServerFn(sendExpiringMemberReminder);
   const [busy, setBusy] = useState(""); const [err, setErr] = useState("");
   const q = useQuery({
-    queryKey: ["admin-live", "inactive"],
-    queryFn: async () => {
-      const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth() - 2);
-      const { data } = await supabase.from("members").select("id, member_code, created_at, profile_id, profiles(display_name, email, phone), memberships(ends_on, status)");
-      const { data: roles } = await supabase.from("user_roles").select("user_id").eq("role", "admin");
-      const admins = new Set((roles ?? []).map((r) => r.user_id));
-      return (data ?? []).filter((m) => {
-        if (admins.has(m.profile_id)) return false;
-        const lastEnd = (m.memberships ?? []).map((x) => x.ends_on).sort().pop();
-        return lastEnd ? new Date(lastEnd) < cutoff : new Date(m.created_at) < cutoff;
-      }).map((m) => ({ ...m, lastEnd: (m.memberships ?? []).map((x) => x.ends_on).sort().pop() ?? null }));
-    },
+    queryKey: ["admin-live", "inactive", timeZone],
+    queryFn: () => loadExpired(),
+    refetchInterval: 60_000,
   });
   async function remove(id: string, name: string) {
     if (!confirm(`Permanently delete ${name}'s profile, payments and history? This cannot be undone.`)) return;
@@ -114,17 +107,28 @@ export function InactiveMembers() {
     catch (e) { setErr(e instanceof Error ? e.message : "Delete failed"); }
     setBusy("");
   }
+  async function remind(membershipId: string, email: string | null, name: string) {
+    if (!email) { setErr(`${name} has no email address on their profile.`); return; }
+    setBusy(membershipId); setErr("");
+    try {
+      await sendReminder({ data: { membershipId, reminderType: "expired" } });
+      await qc.invalidateQueries({ queryKey: ["admin-live", "inactive"] });
+    } catch (e) { setErr(e instanceof Error ? e.message : "Could not send the expired membership email."); }
+    finally { setBusy(""); }
+  }
   return <section className="panel overflow-hidden">
-    <div className="p-5"><h2 className="section-title">Inactive for 2+ months</h2><p className="section-subtitle">Members whose membership ended (or who never bought one) more than 2 months ago.</p>{err && <p className="mt-2 text-sm text-destructive">{err}</p>}</div>
-    <div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-sm"><thead className="border-y border-border bg-muted text-xs uppercase text-muted-foreground"><tr><th className="px-5 py-3">Member</th><th className="px-4 py-3">Contact</th><th className="px-4 py-3">Membership ended</th><th className="px-5 py-3"/></tr></thead>
+    <div className="p-5"><h2 className="section-title">Expired memberships</h2><p className="section-subtitle">Members whose latest membership has expired and who do not have a current or upcoming membership.</p>{err && <p role="alert" className="mt-2 text-sm text-destructive">{err}</p>}</div>
+    <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-sm"><thead className="border-y border-border bg-muted text-xs uppercase text-muted-foreground"><tr><th className="px-5 py-3">Member</th><th className="px-4 py-3">Contact</th><th className="px-4 py-3">Membership ended</th><th className="px-4 py-3">Reminder</th><th className="px-5 py-3"/></tr></thead>
       <tbody className="divide-y divide-border">
-        {q.isLoading && <tr><td colSpan={4} className="p-5"><Loader2 className="animate-spin" size={18}/></td></tr>}
-        {q.data?.length === 0 && <tr><td colSpan={4} className="p-5 text-muted-foreground">No inactive members.</td></tr>}
-        {q.data?.map((m) => { const name = m.profiles?.display_name || m.profiles?.email || m.member_code; return <tr key={m.id}>
-          <td className="px-5 py-3"><b>{name}</b><p className="text-xs text-muted-foreground">{m.member_code}</p></td>
-          <td className="px-4 py-3 text-muted-foreground">{m.profiles?.email}<br/>{m.profiles?.phone}</td>
-          <td className="px-4 py-3">{m.lastEnd ?? "Never purchased"}</td>
-          <td className="px-5 py-3 text-right"><Button size="sm" variant="destructive" disabled={busy === m.id} onClick={() => remove(m.id, name)}>{busy === m.id ? <Loader2 className="animate-spin" size={15}/> : <Trash2 size={15}/>} Delete Profile</Button></td>
+        {q.isLoading && <tr><td colSpan={5} className="p-5"><Loader2 className="animate-spin" size={18}/></td></tr>}
+        {q.isError && <tr><td colSpan={5} className="p-5 text-destructive">Could not load expired memberships: {q.error instanceof Error ? q.error.message : "Please try again."}</td></tr>}
+        {q.data?.members.length === 0 && <tr><td colSpan={5} className="p-5 text-muted-foreground">No expired memberships.</td></tr>}
+        {q.data?.members.map((m) => { const name = m.name; const reminderSent = m.manualReminder?.delivery_status === "sent"; const reminderBusy = busy === m.membershipId; return <tr key={m.id}>
+          <td className="px-5 py-3"><b>{name}</b><p className="text-xs text-muted-foreground">{m.memberCode}</p></td>
+          <td className="px-4 py-3 text-muted-foreground">{m.email || "No email address"}<br/>{m.phone}</td>
+          <td className="px-4 py-3">{m.endsOn}</td>
+          <td className="px-4 py-3 text-xs text-muted-foreground">{reminderSent ? <span className="inline-flex items-center gap-1 text-success"><CheckCircle2 size={14}/>Sent {m.manualReminder?.sent_at ? new Date(m.manualReminder.sent_at).toLocaleDateString("en-IN", { timeZone }) : ""}</span> : m.manualReminder?.delivery_status === "failed" ? "Previous attempt failed" : "Not sent"}</td>
+          <td className="px-5 py-3 text-right"><div className="flex justify-end gap-2"><Button size="sm" disabled={reminderBusy || reminderSent || !m.email} onClick={() => void remind(m.membershipId, m.email, name)}>{reminderBusy ? <Loader2 className="animate-spin" size={15}/> : reminderSent ? <CheckCircle2 size={15}/> : <Mail size={15}/>} {reminderBusy ? "Sending…" : reminderSent ? "Sent" : m.manualReminder?.delivery_status === "failed" ? "Retry reminder" : "Send reminder"}</Button><Button size="sm" variant="destructive" disabled={busy === m.id} onClick={() => void remove(m.id, name)}>{busy === m.id ? <Loader2 className="animate-spin" size={15}/> : <Trash2 size={15}/>} Delete Profile</Button></div></td>
         </tr>; })}
       </tbody></table></div>
   </section>;
