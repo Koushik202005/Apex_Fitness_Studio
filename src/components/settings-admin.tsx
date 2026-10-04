@@ -1,9 +1,9 @@
 import { useEffect, useState, type FormEvent, type ChangeEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { CheckCircle2, CreditCard, ExternalLink, ImagePlus, Loader2, Mail, Save, Trash2, Unplug, ShieldCheck } from "lucide-react";
+import { CheckCircle2, CreditCard, ExternalLink, HardDrive, ImagePlus, Loader2, Mail, RefreshCw, Save, Trash2, Unplug, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { configureSendEmailAuthHook, disconnectPaymentGateway, getGymSettings, getGmailOAuthSettings, getPaymentGatewaySettings, getSendEmailAuthHookSettings, saveGymSettings, savePaymentGatewayCredentials, beginGmailOAuth, disconnectGmailOAuth } from "@/lib/gym.functions";
+import { configureSendEmailAuthHook, disconnectDriveArchive, disconnectPaymentGateway, getDriveArchiveSettings, getGymSettings, getGmailOAuthSettings, getPaymentGatewaySettings, getSendEmailAuthHookSettings, runDriveArchiveNow, saveGymSettings, savePaymentGatewayCredentials, beginDriveArchiveOAuth, beginGmailOAuth, disconnectGmailOAuth } from "@/lib/gym.functions";
 import { CURRENCIES, GYM_COUNTRIES, type CountryCode, type CurrencyCode } from "@/lib/currency";
 
 const MAX_LOGO_SIZE = 2 * 1024 * 1024;
@@ -212,8 +212,104 @@ export function SettingsAdmin() {
     </form>
     <PaymentGatewaySettings />
     <GmailOAuthSettings />
+    <GoogleDriveArchiveSettings />
     <SendEmailAuthHookSettings />
   </section>;
+}
+
+function GoogleDriveArchiveSettings() {
+  const queryClient = useQueryClient();
+  const loadSettings = useServerFn(getDriveArchiveSettings);
+  const beginOAuth = useServerFn(beginDriveArchiveOAuth);
+  const disconnect = useServerFn(disconnectDriveArchive);
+  const runArchive = useServerFn(runDriveArchiveNow);
+  const settings = useQuery({ queryKey: ["drive-archive-settings"], queryFn: () => loadSettings() });
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    const outcome = new URLSearchParams(window.location.search).get("driveArchiveOAuth");
+    if (!outcome) return;
+    const messages: Record<string, string> = {
+      connected: "Google Drive connected. Daily attendance and class booking CSV exports are ready.",
+      denied: "Google authorization was cancelled. Existing archive settings were left unchanged.",
+      invalid: "The Google Drive authorization request was invalid or expired. Start again from Settings.",
+      admin_required: "The administrator account could not be confirmed. Sign in again and retry.",
+      setup_missing: "Google Drive OAuth settings were removed before authorization completed. Start again from Settings.",
+      exchange_failed: "Google could not exchange the authorization code. Check the OAuth client and callback URL.",
+      scope_missing: "Google Drive file access was not granted. Reconnect and approve the requested permission.",
+      email_missing: "Google did not return a verified account email. Reconnect with a Google account.",
+      refresh_missing: "Google did not issue an offline refresh token. Reconnect and approve access again.",
+      folder_failed: "Google authorization succeeded, but the archive folder could not be created. Confirm the Google Drive API is enabled.",
+      failed: "Google Drive could not be connected. Verify Google Cloud OAuth setup and retry.",
+    };
+    if (outcome === "connected") void queryClient.invalidateQueries({ queryKey: ["drive-archive-settings"] });
+    setNotice(messages[outcome] || "Google Drive setup finished.");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("driveArchiveOAuth");
+    window.history.replaceState({}, "", url.toString());
+  }, [queryClient]);
+
+  async function connect(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy("connect"); setError(""); setNotice("");
+    try {
+      const result = await beginOAuth({ data: { clientId: String(form.get("driveClientId") || ""), clientSecret: String(form.get("driveClientSecret") || "") } });
+      window.location.assign(result.authorizationUrl);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start Google Drive authorization.");
+      setBusy("");
+    }
+  }
+
+  async function disconnectDrive() {
+    setBusy("disconnect"); setError(""); setNotice("");
+    try {
+      await disconnect();
+      await queryClient.invalidateQueries({ queryKey: ["drive-archive-settings"] });
+      setNotice("Google Drive disconnected. Existing archive files remain in Drive.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not disconnect Google Drive.");
+    } finally { setBusy(""); }
+  }
+
+  async function archiveNow() {
+    setBusy("archive"); setError(""); setNotice("");
+    try {
+      const result = await runArchive();
+      const summary = result.results.map((entry) => `${entry.dataset}: ${entry.rows} rows${entry.skipped ? " (already archived)" : ""}`).join(" · ");
+      setNotice(`Archive for ${result.archiveDate} finished. ${summary}.`);
+      await queryClient.invalidateQueries({ queryKey: ["drive-archive-settings"] });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not run the archive.");
+    } finally { setBusy(""); }
+  }
+
+  if (settings.isLoading) return <div className="mt-8 flex items-center gap-3 border-t border-border pt-6 text-sm text-muted-foreground"><Loader2 className="animate-spin" size={17}/>Loading Google Drive archive settings…</div>;
+  if (settings.isError || !settings.data) return <div className="mt-8 border-t border-border pt-6"><h3 className="font-semibold">Google Drive data archive</h3><p className="mt-2 text-sm text-destructive">{settings.error instanceof Error ? settings.error.message : "Could not load Drive archive settings."}</p></div>;
+
+  const current = settings.data;
+  return <div className="mt-8 border-t border-border pt-6">
+    <div className="mb-5 flex items-start gap-3">
+      <span className="grid size-10 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><HardDrive size={19}/></span>
+      <div><h3 className="font-display text-lg font-bold">Daily data archive to Google Drive</h3><p className="mt-1 text-sm text-muted-foreground">Automatically export daily attendance and class booking history as CSV files to a private Drive folder. Source records stay in Supabase.</p></div>
+    </div>
+    {current.configured ? <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-success/30 bg-success-soft px-4 py-3">
+      <div className="text-sm"><div className="flex items-center gap-2"><CheckCircle2 className="text-success" size={17}/><span><strong>{current.senderEmail}</strong> is connected</span></div>{current.folderUrl && <a className="ml-6 inline-block text-xs font-semibold text-primary hover:underline" href={current.folderUrl} target="_blank" rel="noreferrer">Open archive folder <ExternalLink className="inline" size={12}/></a>}</div>
+      <div className="flex gap-2"><Button type="button" variant="outline" disabled={busy !== ""} onClick={() => void archiveNow()}>{busy === "archive" ? <Loader2 className="animate-spin" size={15}/> : <RefreshCw size={15}/>}Run archive now</Button><Button type="button" variant="outline" disabled={busy !== ""} onClick={() => void disconnectDrive()}><Unplug size={15}/>Disconnect</Button></div>
+    </div> : <p className="mb-4 rounded-md border border-warning/30 bg-warning-soft px-4 py-3 text-sm text-warning">Connect Google Drive to enable scheduled CSV archives. Once connected, the Netlify job runs daily at 03:15 UTC and archives the previous day using the gym timezone.</p>}
+    <form key={`${current.clientId}:${current.configured}`} onSubmit={(event) => void connect(event)} className="space-y-4">
+      <label className="block max-w-2xl"><span className="form-label">Google OAuth Web client ID</span><input name="driveClientId" type="text" required maxLength={300} defaultValue={current.clientId} placeholder="...apps.googleusercontent.com" className="form-input" autoComplete="off"/><span className="mt-1 block text-xs text-muted-foreground">Reuse your Gmail OAuth Web client if you already created one. Enable the Google Drive API in that same Google Cloud project.</span></label>
+      <label className="block max-w-2xl"><span className="form-label">Google OAuth client secret</span><input name="driveClientSecret" type="password" maxLength={500} required={!current.clientId} placeholder={current.clientId ? "Leave blank to keep saved" : "Paste the client secret"} className="form-input" autoComplete="new-password"/><span className="mt-1 block text-xs text-muted-foreground">The secret and refresh token are encrypted and stored server-side.</span></label>
+      <div className="max-w-2xl rounded-md border border-border bg-muted/30 p-4"><p className="text-sm font-semibold">Authorized redirect URI</p><code className="mt-2 block break-all text-xs text-foreground">{current.callbackUrl || "Loading callback URL…"}</code><p className="mt-2 text-xs text-muted-foreground">Add this exact URI to the OAuth client’s authorized redirect URIs in Google Cloud.</p></div>
+      <div className="max-w-2xl rounded-md border border-border bg-muted/30 p-4 text-xs leading-5 text-muted-foreground">The schedule is provided by Netlify; no Supabase Cron setup is needed. Exports contain member identifiers, names, email addresses, attendance details, and booking details. Restrict access to the connected Google account and archive folder.</div>
+      {(error || notice) && <p role={error ? "alert" : "status"} className={`text-sm ${error ? "text-destructive" : "text-success"}`}>{error || notice}</p>}
+      <div className="flex flex-wrap items-center gap-3"><Button disabled={busy !== ""}>{busy === "connect" ? <Loader2 className="animate-spin" size={16}/> : <ExternalLink size={16}/>} {current.configured ? "Reconnect Google Drive" : "Save credentials and connect Drive"}</Button><a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noreferrer" className="text-sm font-semibold text-primary hover:underline">Open Google Drive API <ExternalLink className="inline" size={13}/></a></div>
+    </form>
+    {current.recentRuns.length > 0 && <div className="mt-6 border-t border-border pt-5"><h4 className="text-sm font-semibold">Recent archive files</h4><div className="mt-2 space-y-2">{current.recentRuns.map((run) => <div key={`${run.archive_date}:${run.dataset}`} className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-xs"><span>{run.archive_date} · {run.dataset.replace("_", " ")} · {run.row_count} rows</span><a className="font-semibold text-primary hover:underline" href={run.url} target="_blank" rel="noreferrer">{run.drive_file_name} <ExternalLink className="inline" size={12}/></a></div>)}</div></div>}
+  </div>;
 }
 
 function PaymentGatewaySettings() {
