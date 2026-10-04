@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { CreditCard, Fingerprint, Loader2, Nfc, Radio, ShieldAlert, UserRound, XCircle } from "lucide-react";
+import { CheckCircle2, Copy, CreditCard, Fingerprint, KeyRound, Loader2, Nfc, Pencil, Plus, Radio, ShieldAlert, Trash2, UserRound, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { checkInWithNfcCard, registerNfcMemberCard, revokeNfcMemberCard } from "@/lib/gym.functions";
+import { checkInWithNfcCard, deleteEsslMemberMapping, getEsslAttendanceSetup, registerNfcMemberCard, revokeNfcMemberCard, saveEsslDevice, saveEsslMemberMapping, saveEsslWebhookToken, setEsslDeviceActive } from "@/lib/gym.functions";
 import { scanMemberNfcToken, writeMemberNfcToken } from "@/lib/nfc-platform";
 type MemberRow = { id: string; member_code: string; status: string; profiles: { display_name: string | null } | null };
 type CredentialRow = { id: string; member_id: string; label: string | null; active: boolean; registered_at: string; members: { member_code: string; profiles: { display_name: string | null } | null } | null };
@@ -21,11 +21,25 @@ export function NfcAttendanceAdmin() {
   const registerCard = useServerFn(registerNfcMemberCard);
   const revokeCard = useServerFn(revokeNfcMemberCard);
   const checkIn = useServerFn(checkInWithNfcCard);
+  const loadEsslSetup = useServerFn(getEsslAttendanceSetup);
+  const persistEsslDevice = useServerFn(saveEsslDevice);
+  const persistEsslMapping = useServerFn(saveEsslMemberMapping);
+  const removeEsslMapping = useServerFn(deleteEsslMemberMapping);
+  const persistEsslWebhook = useServerFn(saveEsslWebhookToken);
+  const toggleEsslDevice = useServerFn(setEsslDeviceActive);
   const [memberId, setMemberId] = useState("");
   const [label, setLabel] = useState("NFC card");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [esslBusy, setEsslBusy] = useState("");
+  const [esslDeviceName, setEsslDeviceName] = useState("eSSL F22");
+  const [esslSerial, setEsslSerial] = useState("");
+  const [editingEsslDevice, setEditingEsslDevice] = useState("");
+  const [mappingDeviceId, setMappingDeviceId] = useState("");
+  const [mappingMemberId, setMappingMemberId] = useState("");
+  const [mappingUserId, setMappingUserId] = useState("");
+  const [webhookUrl, setWebhookUrl] = useState("");
 
   const members = useQuery({
     queryKey: ["nfc-admin-members"],
@@ -86,7 +100,86 @@ export function NfcAttendanceAdmin() {
     finally { setBusy(""); }
   }
 
+  const esslSetup = useQuery({
+    queryKey: ["essl-attendance-setup"],
+    queryFn: () => loadEsslSetup(),
+  });
   const activeMembers = (members.data ?? []).filter((member) => member.status === "active");
+  const esslDevices = esslSetup.data?.devices ?? [];
+  const esslMappings = esslSetup.data?.mappings ?? [];
+
+  async function saveDevice() {
+    if (!esslDeviceName.trim() || !esslSerial.trim()) { setError("Enter the eSSL device name and serial number."); return; }
+    setEsslBusy("device"); setError(""); setMessage("");
+    try {
+      await persistEsslDevice({ data: { ...(editingEsslDevice ? { deviceId: editingEsslDevice } : {}), name: esslDeviceName.trim(), serialNumber: esslSerial.trim() } });
+      setMessage("eSSL device saved. Add a member mapping using the EmployeeCode/User ID shown in eBioServer logs.");
+      setEditingEsslDevice(""); setEsslDeviceName("eSSL F22"); setEsslSerial("");
+      await queryClient.invalidateQueries({ queryKey: ["essl-attendance-setup"] });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save the eSSL device."); }
+    finally { setEsslBusy(""); }
+  }
+
+  async function generateWebhookUrl() {
+    setEsslBusy("webhook"); setError(""); setMessage(""); setWebhookUrl("");
+    try {
+      const bytes = crypto.getRandomValues(new Uint8Array(48));
+      const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const result = await persistEsslWebhook({ data: { token } });
+      const endpoint = new URL(result.webhookPath, window.location.origin);
+      endpoint.searchParams.set("token", token);
+      setWebhookUrl(endpoint.toString());
+      setMessage("Webhook URL generated. Copy it into eBioServer now; the secret is shown only this time.");
+      await queryClient.invalidateQueries({ queryKey: ["essl-attendance-setup"] });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not generate the eSSL webhook URL."); }
+    finally { setEsslBusy(""); }
+  }
+
+  async function copyWebhookUrl() {
+    if (!webhookUrl) return;
+    try { await navigator.clipboard.writeText(webhookUrl); setMessage("Webhook URL copied."); }
+    catch { setError("Could not access the clipboard. Select and copy the URL manually."); }
+  }
+
+  async function saveMapping() {
+    if (!mappingDeviceId || !mappingMemberId || !mappingUserId.trim()) { setError("Choose a device and member, then enter the device EmployeeCode/User ID."); return; }
+    setEsslBusy("mapping"); setError(""); setMessage("");
+    try {
+      await persistEsslMapping({ data: { deviceId: mappingDeviceId, memberId: mappingMemberId, deviceUserId: mappingUserId.trim() } });
+      setMessage("Biometric ID mapped to the member."); setMappingUserId("");
+      await queryClient.invalidateQueries({ queryKey: ["essl-attendance-setup"] });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not save the member mapping."); }
+    finally { setEsslBusy(""); }
+  }
+
+  async function deleteMapping(mappingId: string, memberName: string) {
+    if (!window.confirm(`Remove the biometric ID mapping for ${memberName}?`)) return;
+    setEsslBusy(`mapping:${mappingId}`); setError(""); setMessage("");
+    try {
+      await removeEsslMapping({ data: { mappingId } });
+      setMessage("Member mapping removed.");
+      await queryClient.invalidateQueries({ queryKey: ["essl-attendance-setup"] });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not remove the mapping."); }
+    finally { setEsslBusy(""); }
+  }
+
+  async function changeDeviceActive(deviceId: string, active: boolean) {
+    setEsslBusy(`device:${deviceId}`); setError(""); setMessage("");
+    try {
+      await toggleEsslDevice({ data: { deviceId, active } });
+      setMessage(active ? "eSSL device enabled." : "eSSL device paused.");
+      await queryClient.invalidateQueries({ queryKey: ["essl-attendance-setup"] });
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not update the eSSL device."); }
+    finally { setEsslBusy(""); }
+  }
+
+  function editEsslDevice(device: (typeof esslDevices)[number]) {
+    setEditingEsslDevice(device.id); setEsslDeviceName(device.name); setEsslSerial(device.serialNumber);
+  }
+
+  function resetEsslDeviceForm() {
+    setEditingEsslDevice(""); setEsslDeviceName("eSSL F22"); setEsslSerial("");
+  }
 
   return <div className="space-y-5">
     <section className="panel p-5 md:p-7">
@@ -130,6 +223,45 @@ export function NfcAttendanceAdmin() {
       </div>
     </section>
 
+    <section className="panel space-y-6 p-5 md:p-7">
+      <div className="flex items-start gap-3 border-b border-border pb-5">
+        <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary"><Fingerprint size={22}/></span>
+        <div><h2 className="section-title">eSSL biometric attendance</h2><p className="section-subtitle">Receive eBioServer webhook punch records and map each device employee ID to a CRM member.</p></div>
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        <div className="rounded-xl border border-border p-4">
+          <h3 className="flex items-center gap-2 font-semibold"><Radio size={17}/> Register eSSL device</h3>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">Add the device serial number shown in eBioServer. This can be your F22 or another eSSL attendance terminal.</p>
+          <label className="mt-4 block"><span className="form-label">Device name</span><input className="form-input" maxLength={100} value={esslDeviceName} onChange={(event) => setEsslDeviceName(event.target.value)} placeholder="eSSL F22"/></label>
+          <label className="mt-3 block"><span className="form-label">Device serial number</span><input className="form-input" maxLength={100} value={esslSerial} onChange={(event) => setEsslSerial(event.target.value)} placeholder="SerialNumber from the device"/></label>
+          <div className="mt-4 flex gap-2"><Button className="flex-1" onClick={() => void saveDevice()} disabled={Boolean(esslBusy)}>{esslBusy === "device" ? <Loader2 className="animate-spin" size={16}/> : editingEsslDevice ? <Pencil size={16}/> : <Plus size={16}/>} {editingEsslDevice ? "Update device" : "Add device"}</Button>{editingEsslDevice && <Button variant="outline" onClick={resetEsslDeviceForm} disabled={Boolean(esslBusy)}>Cancel</Button>}</div>
+          {esslSetup.isLoading ? <p className="mt-4 text-xs text-muted-foreground">Loading eSSL setup…</p> : esslSetup.isError ? <p role="alert" className="mt-4 text-xs text-destructive">Could not load eSSL setup: {esslSetup.error.message}</p> : esslDevices.length > 0 && <div className="mt-4 space-y-2">{esslDevices.map((device) => <div key={device.id} className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/50 p-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate font-semibold">{device.name} <span className={`status ml-1 ${device.active ? "status-active" : "status-muted"}`}>{device.active ? "Active" : "Paused"}</span></p><p className="text-xs text-muted-foreground">S/N {device.serialNumber}{device.lastSeenAt ? ` · Last punch ${new Date(device.lastSeenAt).toLocaleString()}` : " · No punches received yet"}</p></div><Button size="sm" variant="outline" onClick={() => editEsslDevice(device)} disabled={Boolean(esslBusy)}><Pencil size={14}/>Edit</Button><Button size="sm" variant="outline" onClick={() => void changeDeviceActive(device.id, !device.active)} disabled={Boolean(esslBusy)}>{esslBusy === `device:${device.id}` ? <Loader2 className="animate-spin" size={14}/> : device.active ? "Pause" : "Enable"}</Button></div>)}</div>}
+        </div>
+
+        <div className="rounded-xl border border-border p-4">
+          <h3 className="flex items-center gap-2 font-semibold"><KeyRound size={17}/> Secure webhook URL</h3>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">Generate one secret URL for this gym and configure it in eBioServer New under Utilities → Web Hook. The raw secret is stored only as a server-side hash.</p>
+          <Button className="mt-4 w-full" variant="outline" onClick={() => void generateWebhookUrl()} disabled={Boolean(esslBusy)}>{esslBusy === "webhook" ? <Loader2 className="animate-spin" size={16}/> : <KeyRound size={16}/>} Generate / rotate webhook URL</Button>
+          {webhookUrl && <div className="mt-3 flex gap-2"><input aria-label="eSSL webhook URL" readOnly className="form-input min-w-0 flex-1 text-xs" value={webhookUrl}/><Button variant="outline" size="icon" aria-label="Copy webhook URL" onClick={() => void copyWebhookUrl()}><Copy size={15}/></Button></div>}
+          <div className="mt-4 rounded-lg bg-muted/50 p-3 text-xs leading-5 text-muted-foreground"><p><b className="text-foreground">eBioServer settings</b></p><p>Use the URL above, enable webhook delivery, and disable payload encryption. HTTPS plus the long secret URL authenticates the sender. Set the response body to <code className="break-all">{"{\"StatusCode\":\"200\",\"Message\":\"Success\"}"}</code>.</p><p className="mt-2">The URL is shown once. If you rotate it, replace the old URL in eBioServer. Never post it publicly.</p></div>
+          <p className="mt-3 text-xs text-muted-foreground">Status: {esslSetup.data?.webhookConfigured ? <span className="inline-flex items-center gap-1 text-success"><CheckCircle2 size={14}/>Secret configured</span> : "Not configured"}</p>
+        </div>
+      </div>
+
+      <div className="border-t border-border pt-5">
+        <h3 className="flex items-center gap-2 font-semibold"><UserRound size={17}/> Map device users to members</h3>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">Use the exact EmployeeCode / User ID present in each eBioServer punch log. The CRM records one eligible check-in per gym-local day.</p>
+        <div className="mt-4 grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
+          <label><span className="form-label">Device</span><select className="form-input" value={mappingDeviceId} onChange={(event) => setMappingDeviceId(event.target.value)}><option value="">Select device</option>{esslDevices.filter((device) => device.active).map((device) => <option key={device.id} value={device.id}>{device.name} · {device.serialNumber}</option>)}</select></label>
+          <label><span className="form-label">CRM member</span><select className="form-input" value={mappingMemberId} onChange={(event) => setMappingMemberId(event.target.value)}><option value="">Select member</option>{activeMembers.map((member) => <option key={member.id} value={member.id}>{member.profiles?.display_name || "Member"} · {member.member_code}</option>)}</select></label>
+          <label><span className="form-label">EmployeeCode / User ID</span><input className="form-input" value={mappingUserId} onChange={(event) => setMappingUserId(event.target.value)} maxLength={100} placeholder="Exact device ID"/></label>
+          <Button onClick={() => void saveMapping()} disabled={Boolean(esslBusy) || !mappingDeviceId || !mappingMemberId || !mappingUserId.trim()}>{esslBusy === "mapping" ? <Loader2 className="animate-spin" size={16}/> : <Plus size={16}/>} Save mapping</Button>
+        </div>
+        {esslMappings.length > 0 ? <div className="mt-5 overflow-x-auto rounded-lg border border-border"><table className="w-full min-w-[680px] text-left text-sm"><thead className="border-b border-border bg-muted text-xs uppercase text-muted-foreground"><tr><th className="px-3 py-2">Device</th><th className="px-3 py-2">eSSL employee ID</th><th className="px-3 py-2">CRM member</th><th className="px-3 py-2">Status</th><th/></tr></thead><tbody className="divide-y divide-border">{esslMappings.map((mapping) => <tr key={mapping.id}><td className="px-3 py-3">{mapping.deviceName}<p className="text-xs text-muted-foreground">{mapping.serialNumber}</p></td><td className="px-3 py-3 font-mono">{mapping.deviceUserId}</td><td className="px-3 py-3">{mapping.memberName}<p className="text-xs text-muted-foreground">{mapping.memberCode}</p></td><td className="px-3 py-3"><span className={`status ${mapping.active ? "status-active" : "status-muted"}`}>{mapping.active ? "Active" : "Inactive"}</span></td><td className="px-3 py-3 text-right"><Button size="sm" variant="outline" disabled={Boolean(esslBusy)} onClick={() => void deleteMapping(mapping.id, mapping.memberName)}>{esslBusy === `mapping:${mapping.id}` ? <Loader2 className="animate-spin" size={14}/> : <Trash2 size={14}/>}Remove</Button></td></tr>)}</tbody></table></div> : <p className="mt-4 text-sm text-muted-foreground">No eSSL member mappings yet.</p>}
+      </div>
+    </section>
     <section className="panel flex gap-3 p-4 text-sm text-muted-foreground"><Fingerprint size={18} className="mt-0.5 shrink-0 text-primary"/><p><b className="text-foreground">Fingerprint devices:</b> a normal web browser cannot enroll or read raw fingerprints. To use fingerprint check-in, connect a biometric terminal and use its supported SDK/API integration.</p></section>
   </div>;
 }
+

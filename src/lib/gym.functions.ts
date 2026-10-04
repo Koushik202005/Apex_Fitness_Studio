@@ -513,6 +513,159 @@ export const checkInWithNfcCard = createServerFn({ method: "POST" })
     return { decision, reason, memberCode, memberName, attendanceRecorded, alreadyCheckedIn };
   });
 
+const esslDeviceSchema = z.object({
+  deviceId: z.string().uuid().optional(),
+  name: z.string().trim().min(1).max(100),
+  serialNumber: z.string().trim().min(1).max(100),
+});
+
+export const getEsslAttendanceSetup = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const [{ data: devices, error: devicesError }, { data: mappings, error: mappingsError }, { data: webhook, error: webhookError }] = await Promise.all([
+      db.from("access_devices").select("id, name, external_id, active, last_seen_at").eq("vendor", "eSSL").order("created_at", { ascending: false }),
+      db.from("essl_member_mappings").select("id, device_id, member_id, device_user_id, active, created_at").order("created_at", { ascending: false }),
+      db.from("essl_webhook_config").select("id").eq("id", 1).maybeSingle(),
+    ]);
+    if (devicesError) throw new Error(devicesError.message);
+    if (mappingsError) throw new Error(mappingsError.message);
+    if (webhookError) throw new Error(webhookError.message);
+
+    const deviceById = new Map((devices ?? []).map((device) => [device.id, device]));
+    const memberIds = [...new Set((mappings ?? []).map((mapping) => mapping.member_id))];
+    const { data: members, error: membersError } = memberIds.length
+      ? await db.from("members").select("id, member_code, profile_id").in("id", memberIds)
+      : { data: [], error: null };
+    if (membersError) throw new Error(membersError.message);
+    const profileIds = [...new Set((members ?? []).map((member) => member.profile_id))];
+    const { data: profiles, error: profilesError } = profileIds.length
+      ? await db.from("profiles").select("id, display_name, email").in("id", profileIds)
+      : { data: [], error: null };
+    if (profilesError) throw new Error(profilesError.message);
+    const memberById = new Map((members ?? []).map((member) => [member.id, member]));
+    const profileById = new Map((profiles ?? []).map((profile) => [profile.id, profile]));
+    return {
+      webhookConfigured: Boolean(webhook),
+      webhookPath: "/.netlify/functions/essl-attendance",
+      devices: (devices ?? []).map((device) => ({
+        id: device.id,
+        name: device.name,
+        serialNumber: device.external_id ?? "",
+        active: device.active,
+        lastSeenAt: device.last_seen_at,
+      })),
+      mappings: (mappings ?? []).flatMap((mapping) => {
+        const device = deviceById.get(mapping.device_id);
+        const member = memberById.get(mapping.member_id);
+        const profile = member ? profileById.get(member.profile_id) : null;
+        if (!device || !member) return [];
+        return [{
+          id: mapping.id,
+          deviceId: mapping.device_id,
+          deviceName: device.name,
+          serialNumber: device.external_id ?? "",
+          memberId: mapping.member_id,
+          memberCode: member.member_code,
+          memberName: profile?.display_name || profile?.email || member.member_code,
+          deviceUserId: mapping.device_user_id,
+          active: mapping.active,
+        }];
+      }),
+    };
+  });
+
+export const saveEsslDevice = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof esslDeviceSchema>) => esslDeviceSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const deviceValues = {
+      name: data.name,
+      vendor: "eSSL",
+      device_type: "fingerprint",
+      external_id: data.serialNumber,
+      active: true,
+    };
+    if (data.deviceId) {
+      const { data: existing, error: existingError } = await db.from("access_devices").select("id, vendor").eq("id", data.deviceId).maybeSingle();
+      if (existingError) throw new Error(existingError.message);
+      if (!existing || existing.vendor !== "eSSL") throw new Error("eSSL device not found.");
+      const { error } = await db.from("access_devices").update(deviceValues).eq("id", data.deviceId);
+      if (error) throw new Error(error.code === "23505" ? "That device serial number is already registered." : error.message);
+      return { saved: true, deviceId: data.deviceId };
+    }
+    const { data: device, error } = await db.from("access_devices").insert(deviceValues).select("id").single();
+    if (error || !device) throw new Error(error?.code === "23505" ? "That device serial number is already registered." : error?.message ?? "Could not save the eSSL device.");
+    return { saved: true, deviceId: device.id };
+  });
+
+export const setEsslDeviceActive = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { deviceId: string; active: boolean }) => z.object({ deviceId: z.string().uuid(), active: z.boolean() }).parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const { data: device, error } = await db.from("access_devices").update({ active: data.active }).eq("id", data.deviceId).eq("vendor", "eSSL").select("id").maybeSingle();
+    if (error || !device) throw new Error(error?.message ?? "eSSL device not found.");
+    return { saved: true };
+  });
+
+export const saveEsslWebhookToken = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { token: string }) => z.object({ token: z.string().min(32).max(256) }).parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const { createHash } = await import("node:crypto");
+    const tokenHash = createHash("sha256").update(data.token).digest("hex");
+    const db = await admin();
+    const { error } = await db.from("essl_webhook_config").upsert({ id: 1, token_hash: tokenHash, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (error) throw new Error(error.message);
+    return { saved: true, webhookPath: "/.netlify/functions/essl-attendance" };
+  });
+
+const esslMemberMappingSchema = z.object({
+  deviceId: z.string().uuid(),
+  memberId: z.string().uuid(),
+  deviceUserId: z.string().trim().min(1).max(100),
+});
+
+export const saveEsslMemberMapping = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: z.input<typeof esslMemberMappingSchema>) => esslMemberMappingSchema.parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const [{ data: device, error: deviceError }, { data: member, error: memberError }] = await Promise.all([
+      db.from("access_devices").select("id").eq("id", data.deviceId).eq("vendor", "eSSL").eq("active", true).maybeSingle(),
+      db.from("members").select("id").eq("id", data.memberId).maybeSingle(),
+    ]);
+    if (deviceError) throw new Error(deviceError.message);
+    if (memberError) throw new Error(memberError.message);
+    if (!device) throw new Error("Select an active eSSL device.");
+    if (!member) throw new Error("Member not found.");
+    const { data: mapping, error } = await db.from("essl_member_mappings").upsert({
+      device_id: data.deviceId,
+      member_id: data.memberId,
+      device_user_id: data.deviceUserId,
+      active: true,
+    }, { onConflict: "device_id,device_user_id" }).select("id").single();
+    if (error || !mapping) throw new Error(error?.message ?? "Could not save the member mapping.");
+    return { saved: true, mappingId: mapping.id };
+  });
+
+export const deleteEsslMemberMapping = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: { mappingId: string }) => z.object({ mappingId: z.string().uuid() }).parse(data))
+  .handler(async ({ data, context }) => {
+    await requireAdmin(context);
+    const db = await admin();
+    const { error } = await db.from("essl_member_mappings").delete().eq("id", data.mappingId);
+    if (error) throw new Error(error.message);
+    return { deleted: true };
+  });
 const archivedGymDataSchema = z.object({
   dataset: z.enum(["payments", "attendance", "classes"]),
   before: z.string().datetime(),
@@ -1347,3 +1500,4 @@ export const saveGymSettings = createServerFn({ method: "POST" })
     }
     return { ...updates, ...(logoUrl !== undefined ? { logo_url: logoUrl } : {}) };
   });
+

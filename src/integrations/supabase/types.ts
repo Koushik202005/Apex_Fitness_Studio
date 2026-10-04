@@ -97,6 +97,21 @@ export type Database = {
         }
         Relationships: []
       }
+      essl_webhook_config: {
+        Row: { id: number; token_hash: string; updated_at: string }
+        Insert: { id?: number; token_hash: string; updated_at?: string }
+        Update: { id?: number; token_hash?: string; updated_at?: string }
+        Relationships: []
+      }
+      essl_member_mappings: {
+        Row: { id: string; device_id: string; member_id: string; device_user_id: string; active: boolean; created_at: string; updated_at: string }
+        Insert: { id?: string; device_id: string; member_id: string; device_user_id: string; active?: boolean; created_at?: string; updated_at?: string }
+        Update: { id?: string; device_id?: string; member_id?: string; device_user_id?: string; active?: boolean; created_at?: string; updated_at?: string }
+        Relationships: [
+          { foreignKeyName: "essl_member_mappings_device_id_fkey"; columns: ["device_id"]; isOneToOne: false; referencedRelation: "access_devices"; referencedColumns: ["id"] },
+          { foreignKeyName: "essl_member_mappings_member_id_fkey"; columns: ["member_id"]; isOneToOne: false; referencedRelation: "members"; referencedColumns: ["id"] },
+        ]
+      }
       access_events: {
         Row: {
           created_at: string
@@ -1466,3 +1481,5 @@ export const Constants = {
     },
   },
 } as const
+
+
